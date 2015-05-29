@@ -1394,13 +1394,13 @@ MySQLQueryReturn php_mysql_do_query(const String& query, const Variant& link_id,
       }
     } else {
       HHVM_FN(preg_match)("/^(?:(?:\\/\\*.*?\\*\\/)|\\(|\\s)*"
-                          "(begin|commit|rollback|select)/is",
+                          "(start transaction|begin|commit|rollback|select)/is",
                           query, ref(matches));
       size = matches.toArray().size();
       auto marray = matches.toArray();
       if (size == 2) {
         std::string verb = toLower(marray[1].toString().data());
-        rconn->m_xaction_count = ((verb == "begin") ? 1 : 0);
+        rconn->m_xaction_count = ((verb == "begin" || verb == "start transaction") ? 1 : 0);
         ServerStats::Log(std::string("sql.query.") + verb, 1);
         if (RuntimeOption::EnableStats && RuntimeOption::EnableSQLTableStats) {
           MySqlStats::Record(verb);

@@ -25,6 +25,13 @@ namespace HPHP {
 
 ///////////////////////////////////////////////////////////////////////////////
 
+enum class UnserializeMode {
+  Value = 0,
+  Key = 1,
+  ColValue = 2,
+  ColKey = 3,
+};
+
 struct VariableUnserializer {
 
   /*
@@ -91,7 +98,7 @@ struct VariableUnserializer {
   /*
    * Push v onto the vector of refs for future reference.
    */
-  void add(Variant* v, Uns::Mode mode);
+  void add(Variant* v, UnserializeMode mode);
 
   /*
    * Used by the 'r' encoding to get a reference.
@@ -102,6 +109,12 @@ struct VariableUnserializer {
    * Used by the 'R' encoding to get a reference.
    */
   Variant* getByRef(int id);
+
+  /*
+   * Store properties/array elements that get overwritten incase they are
+   * referenced later during unserialization
+   */
+  void putInOverwrittenList(const Variant& v);
 
 private:
   /*
@@ -117,6 +130,8 @@ private:
     uintptr_t m_data;
   };
 
+  Array m_overwrittenList;
+
   void check() const;
 
   Type m_type;
@@ -128,6 +143,9 @@ private:
 };
 
 ///////////////////////////////////////////////////////////////////////////////
+
+void unserializeVariant(Variant&, VariableUnserializer *unserializer,
+                        UnserializeMode mode = UnserializeMode::Value);
 
 }
 

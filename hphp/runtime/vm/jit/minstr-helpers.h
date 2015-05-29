@@ -34,7 +34,7 @@ TypedValue* baseGImpl(TypedValue key) {
   StringData* name = prepareKey(key);
   SCOPE_EXIT { decRefStr(name); };
   VarEnv* varEnv = g_context->m_globalVarEnv;
-  assert(varEnv != nullptr);
+  assertx(varEnv != nullptr);
   base = varEnv->lookup(name);
   if (base == nullptr) {
     if (warn) {
@@ -101,6 +101,18 @@ inline TypedValue* nm(Class* ctx, TypedValue* base, TypedValue key,     \
 PROP_HELPER_TABLE(X)
 #undef X
 
+// NullSafe prop.
+inline TypedValue* propCQ(Class* ctx, TypedValue* base, StringData* key,
+                          MInstrState* mis) {
+  return nullSafeProp(mis->tvScratch, mis->tvRef, ctx, base, key);
+}
+
+// NullSafe prop with object base.
+inline TypedValue* propCOQ(Class* ctx, ObjectData* base, StringData* key,
+                           MInstrState* mis) {
+  return base->prop(&mis->tvScratch, &mis->tvRef, ctx, key);
+}
+
 //////////////////////////////////////////////////////////////////////
 
 template <KeyType keyType, bool isObj>
@@ -131,6 +143,26 @@ inline TypedValue nm(Class* ctx, TypedValue* base, key_type<kt> key, \
 }
 CGETPROP_HELPER_TABLE(X)
 #undef X
+
+//////////////////////////////////////////////////////////////////////
+
+// NullSafe prop.
+inline TypedValue cGetPropSQ(Class* ctx, TypedValue* base,
+                             StringData* key, MInstrState* mis) {
+  TypedValue scratch;
+  auto const result = nullSafeProp(scratch, mis->tvRef, ctx, base, key);
+  tvRefcountedIncRef(result);
+  return *result;
+}
+
+// NullSafe prop with object base.
+inline TypedValue cGetPropSOQ(Class* ctx, ObjectData* base,
+                             StringData* key, MInstrState* mis) {
+  TypedValue scratch;
+  auto const result = base->prop(&scratch, &mis->tvRef, ctx, key);
+  tvRefcountedIncRef(result);
+  return *result;
+}
 
 //////////////////////////////////////////////////////////////////////
 
@@ -266,7 +298,7 @@ TypedValue incDecPropImpl(
 ) {
   auto result = make_tv<KindOfUninit>();
   HPHP::IncDecProp<true, isObj>(ctx, op, base, key, result);
-  assert(result.m_type != KindOfRef);
+  assertx(result.m_type != KindOfRef);
   return result;
 }
 
@@ -397,7 +429,7 @@ const TypedValue* elemArrayNotFound(const StringData* k) {
 
 template<KeyType keyType, bool checkForInt, bool warn>
 inline const TypedValue* elemArrayImpl(TypedValue* a, key_type<keyType> key) {
-  assert(a->m_type == KindOfArray);
+  assertx(a->m_type == KindOfArray);
   auto const ad = a->m_data.parr;
   auto const ret = checkForInt ? checkedGet(ad, key) : ad->nvGet(key);
   return ret ? ret : elemArrayNotFound<warn>(key);
@@ -428,23 +460,19 @@ TypedValue arrayGetNotFound(const StringData* k);
 template<KeyType keyType, bool checkForInt>
 TypedValue arrayGetImpl(ArrayData* a, key_type<keyType> key) {
   auto ret = checkForInt ? checkedGet(a, key) : a->nvGet(key);
-  if (ret) {
-    ret = tvToCell(ret);
-    tvRefcountedIncRef(ret);
-    return *ret;
-  }
+  if (ret) return *ret;
   return arrayGetNotFound(key);
 }
 
-#define ARRAYGET_HELPER_TABLE(m)               \
-  /* name        keyType     checkForInt   */  \
-  m(arrayGetS,   KeyType::Str,   false)        \
-  m(arrayGetSi,  KeyType::Str,    true)        \
-  m(arrayGetI,   KeyType::Int,   false)
+#define ARRAYGET_HELPER_TABLE(m)                           \
+  /* name        keyType     checkForInt */                \
+  m(arrayGetS,  KeyType::Str,   false)                     \
+  m(arrayGetSi, KeyType::Str,    true)                     \
+  m(arrayGetI,  KeyType::Int,   false)                     \
 
-#define X(nm, keyType, checkForInt)                  \
-inline TypedValue nm(ArrayData* a, key_type<keyType> key) {\
-  return arrayGetImpl<keyType, checkForInt>(a, key);\
+#define X(nm, keyType, checkForInt)                          \
+inline TypedValue nm(ArrayData* a, key_type<keyType> key) {  \
+  return arrayGetImpl<keyType, checkForInt>(a, key);         \
 }
 ARRAYGET_HELPER_TABLE(X)
 #undef X
@@ -540,7 +568,7 @@ typename ShuffleReturn<setRef>::return_type
 arraySetImpl(ArrayData* a, key_type<keyType> key, Cell value, RefData* ref) {
   static_assert(keyType != KeyType::Any,
                 "KeyType::Any is not supported in arraySetMImpl");
-  assert(cellIsPlausible(value));
+  assertx(cellIsPlausible(value));
   const bool copy = a->hasMultipleRefs();
   ArrayData* ret = checkForInt ? checkedSet(a, key, value, copy)
                                : uncheckedSet(a, key, value, copy);

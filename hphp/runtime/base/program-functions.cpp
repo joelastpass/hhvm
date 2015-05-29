@@ -35,16 +35,18 @@
 #include "hphp/runtime/base/simple-counter.h"
 #include "hphp/runtime/base/stat-cache.h"
 #include "hphp/runtime/base/stream-wrapper-registry.h"
+#include "hphp/runtime/base/surprise-flags.h"
 #include "hphp/runtime/base/thread-init-fini.h"
 #include "hphp/runtime/base/type-conversions.h"
 #include "hphp/runtime/base/types.h"
 #include "hphp/runtime/base/unit-cache.h"
+#include "hphp/runtime/base/thread-safe-setlocale.h"
 #include "hphp/runtime/debugger/debugger.h"
 #include "hphp/runtime/debugger/debugger_client.h"
 #include "hphp/runtime/debugger/debugger_hook_handler.h"
 #include "hphp/runtime/ext/apc/ext_apc.h"
-#include "hphp/runtime/ext/ext_fb.h"
-#include "hphp/runtime/ext/extension.h"
+#include "hphp/runtime/ext/xhprof/ext_xhprof.h"
+#include "hphp/runtime/ext/extension-registry.h"
 #include "hphp/runtime/ext/json/ext_json.h"
 #include "hphp/runtime/ext/std/ext_std_file.h"
 #include "hphp/runtime/ext/std/ext_std_function.h"
@@ -53,6 +55,7 @@
 #include "hphp/runtime/ext/xenon/ext_xenon.h"
 #include "hphp/runtime/server/admin-request-handler.h"
 #include "hphp/runtime/server/http-request-handler.h"
+#include "hphp/runtime/server/rpc-request-handler.h"
 #include "hphp/runtime/server/http-server.h"
 #include "hphp/runtime/server/pagelet-server.h"
 #include "hphp/runtime/server/replay-transport.h"
@@ -66,9 +69,12 @@
 #include "hphp/runtime/vm/runtime.h"
 #include "hphp/runtime/vm/treadmill.h"
 #include "hphp/system/constants.h"
+#include "hphp/util/code-cache.h"
+#include "hphp/util/compatibility.h"
 #include "hphp/util/capability.h"
 #include "hphp/util/current-executable.h"
 #include "hphp/util/embedded-data.h"
+#include "hphp/util/hardware-counter.h"
 #include "hphp/util/light-process.h"
 #include "hphp/util/process.h"
 #include "hphp/util/repo-schema.h"
@@ -78,7 +84,7 @@
 #include "hphp/util/timer.h"
 
 #include <folly/Portability.h>
-#include <folly/experimental/Singleton.h>
+#include <folly/Singleton.h>
 
 #include <boost/program_options/options_description.hpp>
 #include <boost/program_options/positional_options.hpp>
@@ -413,13 +419,12 @@ static void handle_exception_helper(bool& ret,
                                     bool& error,
                                     bool richErrorMsg) {
   // Clear oom/timeout while handling exception and restore them afterwards.
-  auto& data = ThreadInfo::s_threadInfo.getNoCheck()->m_reqInjectionData;
-  auto flags = data.getConditionFlags();
-  auto origFlags = flags->load() & RequestInjectionData::ResourceFlags;
-  flags->fetch_and(~RequestInjectionData::ResourceFlags);
+  auto& flags = surpriseFlags();
+  auto const origFlags = flags.load() & ResourceFlags;
+  flags.fetch_and(~ResourceFlags);
 
   SCOPE_EXIT {
-    flags->fetch_or(origFlags);
+    flags.fetch_or(origFlags);
   };
 
   try {
@@ -535,11 +540,11 @@ static void handle_resource_exceeded_exception() {
   try {
     throw;
   } catch (RequestTimeoutException&) {
-    ThreadInfo::s_threadInfo->m_reqInjectionData.setTimedOutFlag();
+    setSurpriseFlag(TimedOutFlag);
   } catch (RequestCPUTimeoutException&) {
-    ThreadInfo::s_threadInfo->m_reqInjectionData.setCPUTimedOutFlag();
+    setSurpriseFlag(CPUTimedOutFlag);
   } catch (RequestMemoryExceededException&) {
-    ThreadInfo::s_threadInfo->m_reqInjectionData.setMemExceededFlag();
+    setSurpriseFlag(MemExceededFlag);
   } catch (...) {}
 }
 
@@ -550,7 +555,7 @@ void handle_destructor_exception(const char* situation) {
     throw;
   } catch (ExitException &e) {
     // ExitException is fine, no need to show a warning.
-    ThreadInfo::s_threadInfo->setPendingException(e.clone());
+    TI().setPendingException(e.clone());
     return;
   } catch (Object &e) {
     // For user exceptions, invoke the user exception handler
@@ -563,7 +568,7 @@ void handle_destructor_exception(const char* situation) {
       errorMsg += "(unable to call toString())";
     }
   } catch (Exception &e) {
-    ThreadInfo::s_threadInfo->setPendingException(e.clone());
+    TI().setPendingException(e.clone());
     errorMsg = situation;
     errorMsg += " raised a fatal error: ";
     errorMsg += e.what();
@@ -575,7 +580,7 @@ void handle_destructor_exception(const char* situation) {
   // If there is a user error handler it will be invoked, otherwise
   // the default error handler will be invoked.
   try {
-    raise_debugging("%s", errorMsg.c_str());
+    raise_warning_unsampled("%s", errorMsg.c_str());
   } catch (...) {
     handle_resource_exceeded_exception();
 
@@ -599,8 +604,7 @@ void execute_command_line_begin(int argc, char **argv, int xhprof,
   auto const context = g_context.getNoCheck();
   context->obSetImplicitFlush(true);
 
-  auto variablesOrder = ThreadInfo::s_threadInfo.getNoCheck()
-    ->m_reqInjectionData.getVariablesOrder();
+  auto& variablesOrder = RID().getVariablesOrder();
 
   if (variablesOrder.find('e') != std::string::npos ||
       variablesOrder.find('E') != std::string::npos) {
@@ -668,19 +672,18 @@ void execute_command_line_begin(int argc, char **argv, int xhprof,
   }
 
   if (xhprof) {
-    f_xhprof_enable(xhprof, uninit_null().toArray());
+    HHVM_FN(xhprof_enable)(xhprof, uninit_null().toArray());
   }
 
   if (RuntimeOption::RequestTimeoutSeconds) {
-    ThreadInfo::s_threadInfo->m_reqInjectionData.setTimeout(
-      RuntimeOption::RequestTimeoutSeconds);
+    RID().setTimeout(RuntimeOption::RequestTimeoutSeconds);
   }
 
   if (RuntimeOption::XenonForceAlwaysOn) {
     Xenon::getInstance().surpriseAll();
   }
 
-  Extension::RequestInitModules();
+  ExtensionRegistry::requestInit();
   // If extension constants were used in the ini files, they would have come
   // out as 0 in the previous pass. We will re-import only the constants that
   // have been later bound. All other non-constant configs should remain as they
@@ -694,37 +697,26 @@ void execute_command_line_begin(int argc, char **argv, int xhprof,
 }
 
 void execute_command_line_end(int xhprof, bool coverage, const char *program) {
-  ThreadInfo *ti = ThreadInfo::s_threadInfo.getNoCheck();
-
+  MM().collect();
   if (RuntimeOption::EvalDumpTC) {
     HPHP::jit::tc_dump();
   }
-
   if (xhprof) {
-    Variant profileData = f_xhprof_disable();
+    Variant profileData = HHVM_FN(xhprof_disable)();
     if (!profileData.isNull()) {
-      HHVM_FN(var_dump)(HHVM_FN(json_encode)(f_xhprof_disable()));
+      HHVM_FN(var_dump)(HHVM_FN(json_encode)(HHVM_FN(xhprof_disable)()));
     }
   }
   g_context->onShutdownPostSend();
   Eval::Debugger::InterruptPSPEnded(program);
   hphp_context_exit();
   hphp_session_exit();
-  if (coverage && ti->m_reqInjectionData.getCoverage() &&
+  auto& ti = TI();
+  if (coverage && ti.m_reqInjectionData.getCoverage() &&
       !RuntimeOption::CodeCoverageOutputFile.empty()) {
-    ti->m_coverage->Report(RuntimeOption::CodeCoverageOutputFile);
+    ti.m_coverage->Report(RuntimeOption::CodeCoverageOutputFile);
   }
 }
-
-#if defined(__APPLE__) || defined(__CYGWIN__)
-const void* __hot_start = nullptr;
-const void* __hot_end = nullptr;
-#else
-extern "C" {
-void __attribute__((__weak__)) __hot_start();
-void __attribute__((__weak__)) __hot_end();
-}
-#endif
 
 #if FACEBOOK && defined USE_SSECRC
 // Overwrite the functiosn
@@ -904,6 +896,9 @@ static int start_server(const std::string &username, int xhprof) {
     (RuntimeOption::AdminLogFormat, RuntimeOption::AdminLogSymLink,
      RuntimeOption::AdminLogFile,
      username);
+  RPCRequestHandler::GetAccessLog().init
+    (RuntimeOption::AccessLogDefaultFormat, RuntimeOption::RPCLogs,
+     username);
 
 #if !defined(SKIP_USER_CHANGE)
   if (!username.empty()) {
@@ -921,7 +916,7 @@ static int start_server(const std::string &username, int xhprof) {
   HttpServer::Server = std::make_shared<HttpServer>();
 
   if (xhprof) {
-    f_xhprof_enable(xhprof, uninit_null().toArray());
+    HHVM_FN(xhprof_enable)(xhprof, uninit_null().toArray());
   }
 
   if (RuntimeOption::RepoPreload) {
@@ -1194,6 +1189,32 @@ std::string get_right_option_name(const basic_parsed_options<char>& opts,
 }
 #endif
 
+//
+// Note that confusingly there are two different implementations
+// of zend_strtod.
+//
+// The one from
+//   hphp/runtime/ext_zend_compat/php-src/Zend/zend_strtod.h
+// does not wrap with HPHP namespace, and implements
+// functionality required by the zend extension compatibility layer.
+// Empirically, this zend_strtod.h file can't be included because
+// it includes <zend.h> which isn't on any search path when compiling this.
+//
+// The zend_startup_strtod from
+//   hphp/runtime/base/zend-strtod.h
+// uses the HPHP namespace, is used for other purposes,
+// and predates the EZC extensions.
+//
+// Before we can call zend_strtod from zend compatibility extensions,
+// we need to initialize it.  Since it doesn't seem
+// to work to include the .h file, just sleaze declare it here.
+//
+// See the related issue https://github.com/facebook/hhvm/issues/5244
+//
+extern "C" {
+  void zend_startup_strtod(void);
+}
+
 static int execute_program_impl(int argc, char** argv) {
   string usage = "Usage:\n\n   ";
   usage += argv[0];
@@ -1335,16 +1356,14 @@ static int execute_program_impl(int argc, char** argv) {
         return -1;
       }
       if (po.config.empty() && !vm.count("no-config")) {
-        auto default_config_file = "/etc/hhvm/php.ini";
-        if (access(default_config_file, R_OK) != -1) {
-          Logger::Verbose("Using default config file: %s", default_config_file);
-          po.config.push_back(default_config_file);
-        }
-        default_config_file = "/etc/hhvm/config.hdf";
-        if (access(default_config_file, R_OK) != -1) {
-          Logger::Verbose("Using default config file: %s", default_config_file);
-          po.config.push_back(default_config_file);
-        }
+        auto file_callback = [&po] (const char *filename) {
+          Logger::Verbose("Using default config file: %s", filename);
+          po.config.push_back(filename);
+        };
+        add_default_config_files_globbed("/etc/hhvm/php*.ini",
+                                         file_callback);
+        add_default_config_files_globbed("/etc/hhvm/config*.hdf",
+                                         file_callback);
       }
 // When we upgrade boost, we can remove this and also get rid of the parent
 // try statement and move opts back into the original try block
@@ -1421,8 +1440,22 @@ static int execute_program_impl(int argc, char** argv) {
   // we need to initialize pcre cache table very early
   pcre_init();
 
-  MemoryManager::TlsWrapper::getCheck();
+#ifdef ENABLE_ZEND_COMPAT
+  //
+  // Initialize in the zend extension compatibility layer, as needed
+  // before any calls from legacy zend extensions to zend_strtod. See
+  // the extern "C" declaration of this function, above.
+  //
+  zend_startup_strtod();
+#endif
 
+  MemoryManager::TlsWrapper::getCheck();
+  if (RuntimeOption::ServerExecutionMode()) {
+    // Create the hardware counter before reading options,
+    // so that the main thread never has inherit set in server
+    // mode
+    HardwareCounter::s_counter.getCheck();
+  }
   IniSetting::Map ini = IniSetting::Map::object;
   Hdf config;
   // Start with .hdf and .ini files
@@ -1483,6 +1516,7 @@ static int execute_program_impl(int argc, char** argv) {
   });
   LightProcess::Initialize(RuntimeOption::LightProcessFilePrefix,
                            RuntimeOption::LightProcessCount,
+                           RuntimeOption::EvalRecordSubprocessTimes,
                            inherited_fds);
 
   if (!ShmCounters::initialize(true, Logger::Error)) {
@@ -1541,6 +1575,10 @@ static int execute_program_impl(int argc, char** argv) {
     }
 
     set_execution_mode("run");
+    /* recreate the hardware counters for the main thread now that we know
+     * whether to include subprocess times */
+    HardwareCounter::s_counter.destroy();
+    HardwareCounter::s_counter.getCheck();
 
     int new_argc;
     char **new_argv;
@@ -1580,6 +1618,7 @@ static int execute_program_impl(int argc, char** argv) {
       ret = 0;
       while (true) {
         try {
+          assert(po.debugger_options.fileName == file);
           execute_command_line_begin(new_argc, new_argv,
                                      po.xhprofFlags, po.config);
           // Set the proxy for this thread to be the localProxy we just
@@ -1601,6 +1640,7 @@ static int execute_program_impl(int argc, char** argv) {
 
           if (!e.m_args->empty()) {
             file = e.m_args->at(0);
+            po.debugger_options.fileName = file;
             client_args = e.m_args;
             free(new_argv);
             prepare_args(new_argc, new_argv, *client_args, nullptr);
@@ -1747,15 +1787,19 @@ void hphp_process_init() {
   init_stack_limits(&attr);
   pthread_attr_destroy(&attr);
 
+  Process::InitProcessStatics();
+
+  // initialize the tzinfo cache.
+  timezone_init();
+
+  init_thread_locals();
+
   struct sigaction action = {};
   action.sa_sigaction = on_timeout;
   action.sa_flags = SA_SIGINFO | SA_NODEFER;
   sigaction(SIGVTALRM, &action, nullptr);
   // start takes milliseconds, Period is a double in seconds
   Xenon::getInstance().start(1000 * RuntimeOption::XenonPeriodSeconds);
-
-  Process::InitProcessStatics();
-  init_thread_locals();
 
   // Initialize per-process dynamic PHP-visible consts before ClassInfo::Load()
   k_PHP_BINARY = makeStaticString(current_executable_path());
@@ -1767,9 +1811,6 @@ void hphp_process_init() {
 
   // reinitialize pcre table
   pcre_reinit();
-
-  // initialize the tzinfo cache.
-  timezone_init();
 
   // the liboniguruma docs say this isnt needed,
   // but the implementation of init is not
@@ -1784,7 +1825,7 @@ void hphp_process_init() {
   PageletServer::Restart();
   XboxServer::Restart();
   Stream::RegisterCoreWrappers();
-  Extension::InitModules();
+  ExtensionRegistry::moduleInit();
   for (InitFiniNode *in = extra_process_init; in; in = in->next) {
     in->func();
   }
@@ -1856,8 +1897,10 @@ static bool hphp_warmup(ExecutionContext *context,
 void hphp_session_init() {
   assert(!s_sessionInitialized);
   init_thread_locals();
-  ThreadInfo::s_threadInfo->onSessionInit();
+  TI().onSessionInit();
   MM().resetExternalStats();
+
+  g_thread_safe_locale_handler->reset();
   Treadmill::startRequest();
 
 #ifdef ENABLE_SIMPLE_COUNTER
@@ -1909,7 +1952,7 @@ bool hphp_invoke(ExecutionContext *context, const std::string &cmd,
   }
 
   MM().resetCouldOOM(isStandardRequest());
-  ThreadInfo::s_threadInfo.getNoCheck()->m_reqInjectionData.resetTimer();
+  RID().resetTimer();
 
   LitstrTable::get().setReading();
 
@@ -1950,6 +1993,8 @@ bool hphp_invoke(ExecutionContext *context, const std::string &cmd,
 
 void hphp_context_shutdown() {
   // Run shutdown handlers. This may cause user code to run.
+  g_thread_safe_locale_handler->reset();
+
   auto const context = g_context.getNoCheck();
   context->destructObjects();
   context->onRequestShutdown();
@@ -1958,7 +2003,7 @@ void hphp_context_shutdown() {
   DEBUGGER_ATTACHED_ONLY(phpDebuggerRequestShutdownHook());
 
   // Extensions could have shutdown handlers
-  Extension::RequestShutdownModules();
+  ExtensionRegistry::requestShutdown();
 
   // Extension shutdown could have re-initialized some
   // request locals
@@ -2014,7 +2059,7 @@ void hphp_session_exit() {
   // finishes.
   Treadmill::finishRequest();
 
-  ThreadInfo::s_threadInfo->clearPendingException();
+  TI().clearPendingException();
 
   {
     ServerStatsHelper ssh("rollback");
@@ -2024,10 +2069,11 @@ void hphp_session_exit() {
     free_global_variables_after_sweep();
   }
 
-  ThreadInfo::s_threadInfo->onSessionExit();
+  TI().onSessionExit();
   assert(MM().empty());
 
   s_sessionInitialized = false;
+  s_extra_request_microseconds = 0;
 }
 
 void hphp_process_exit() {
@@ -2038,7 +2084,7 @@ void hphp_process_exit() {
   g_context.getCheck();
   Eval::Debugger::Stop();
   g_context.destroy();
-  Extension::ShutdownModules();
+  ExtensionRegistry::moduleShutdown();
   LightProcess::Close();
   for (InitFiniNode *in = extra_process_exit; in; in = in->next) {
     in->func();

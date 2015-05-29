@@ -246,6 +246,15 @@ struct sparse_id_set {
   }
 
   /*
+   * Returns: whether this sparse_id_set contains a particular value.  O(1).
+   * Does not require that the id is in range.
+   */
+  bool contains_safe(LookupT lt) const {
+    auto const t = Extract()(lt);
+    return t < m_universe_size && containsImpl(t);
+  }
+
+  /*
    * Insert a new value into the set.  O(1)
    *
    * Post: contains an element with the id of `lt'
@@ -451,7 +460,7 @@ struct sparse_id_map {
     auto initialize = [&] {
       for (; idx < m_next; ++idx) {
         new (&dense()[idx]) value_type(o.dense()[idx]);
-        sparse()[idx] = o.dense()[idx].first;
+        sparse()[o.dense()[idx].first] = idx;
       }
     };
     if (std::is_trivially_destructible<V>::value ||
@@ -575,6 +584,15 @@ struct sparse_id_map {
    */
   bool contains(LookupKey lk) const {
     return containsImpl(KExtract()(lk));
+  }
+
+  /*
+   * Returns: whether this sparse_id_map contains a particular value.  O(1).
+   * Does not require that the id is in range.
+   */
+  bool contains_safe(LookupKey lk) const {
+    auto const k = KExtract()(lk);
+    return k < m_universe_size && containsImpl(k);
   }
 
   /*

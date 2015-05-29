@@ -33,7 +33,7 @@ void VariableUnserializer::set(const char* buf, const char* end) {
 
 Variant VariableUnserializer::unserialize() {
   Variant v;
-  v.unserialize(this);
+  unserializeVariant(v, this);
   return v;
 }
 
@@ -94,6 +94,10 @@ bool VariableUnserializer::isWhitelistedClass(const String& clsName) const {
     }
   }
   return false;
+}
+
+void VariableUnserializer::putInOverwrittenList(const Variant& v) {
+  m_overwrittenList.append(v);
 }
 
 ///////////////////////////////////////////////////////////////////////////////

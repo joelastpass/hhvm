@@ -26,6 +26,8 @@
 #include "hphp/runtime/base/countable.h"
 #include "hphp/runtime/base/types.h"
 #include "hphp/runtime/base/typed-value.h"
+#include "hphp/runtime/base/sort-flags.h"
+#include "hphp/runtime/base/cap-code.h"
 
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
@@ -62,12 +64,12 @@ protected:
    * it, change the MixedArray::Make functions as appropriate.
    */
   explicit ArrayData(ArrayKind kind)
-    : m_sizeAndPos(uint32_t(-1))
-    , m_kindAndCount(kind << 24) {
+    : m_sizeAndPos(uint32_t(-1)) {
+    m_hdr.init(static_cast<HeaderKind>(kind), 0);
     assert(m_size == -1);
     assert(m_pos == 0);
-    assert(m_kind == kind);
-    assert(m_count == 0);
+    assert(m_hdr.kind == static_cast<HeaderKind>(kind));
+    assert(getCount() == 0);
   }
 
   /*
@@ -81,7 +83,6 @@ protected:
 
 public:
   IMPLEMENT_COUNTABLE_METHODS
-  void setRefCount(RefCount n) { m_count = n; }
 
   /**
    * Create a new ArrayData with specified array element(s).
@@ -110,7 +111,15 @@ public:
    * return the array kind for fast typechecks
    */
   ArrayKind kind() const {
-    return m_kind;
+    return static_cast<ArrayKind>(m_hdr.kind);
+  }
+
+  /*
+   * Return the capacity stored in the header. Not to be confused
+   * with MixedArray::capacity
+   */
+  uint32_t cap() const {
+    return m_hdr.aux.decode();
   }
 
   /**
@@ -144,13 +153,13 @@ public:
    */
   bool noCopyOnWrite() const;
 
-  bool isPacked() const { return m_kind == kPackedKind; }
-  bool isStruct() const { return m_kind == kStructKind; }
-  bool isMixed() const { return m_kind == kMixedKind; }
-  bool isApcArray() const { return m_kind == kApcKind; }
-  bool isGlobalsArray() const { return m_kind == kGlobalsKind; }
-  bool isProxyArray() const { return m_kind == kProxyKind; }
-  bool isEmptyArray() const { return m_kind == kEmptyKind; }
+  bool isPacked() const { return kind() == kPackedKind; }
+  bool isStruct() const { return kind() == kStructKind; }
+  bool isMixed() const { return kind() == kMixedKind; }
+  bool isApcArray() const { return kind() == kApcKind; }
+  bool isGlobalsArray() const { return kind() == kGlobalsKind; }
+  bool isProxyArray() const { return kind() == kProxyKind; }
+  bool isEmptyArray() const { return kind() == kEmptyKind; }
 
   /*
    * Returns whether or not this array contains "vector-like" data.
@@ -297,7 +306,7 @@ public:
    */
   bool advanceMArrayIter(MArrayIter& fp);
 
-  ArrayData* escalateForSort();
+  ArrayData* escalateForSort(SortFunction sort_function);
   void ksort(int sort_flags, bool ascending);
   void sort(int sort_flags, bool ascending);
   void asort(int sort_flags, bool ascending);
@@ -375,14 +384,7 @@ public:
   static ArrayData* GetScalarArray(ArrayData *arr);
   static ArrayData* GetScalarArray(ArrayData *arr, const std::string& key);
 
-  static constexpr size_t offsetofKind() {
-    return offsetof(ArrayData, m_kind);
-  }
-
-  static constexpr size_t offsetofSize() {
-    return offsetof(ArrayData, m_size);
-  }
-  static constexpr size_t sizeofKind() { return sizeof(m_kind); }
+  static constexpr size_t offsetofSize() { return offsetof(ArrayData, m_size); }
   static constexpr size_t sizeofSize() { return sizeof(m_size); }
 
   static const char* kindToString(ArrayKind kind);
@@ -391,8 +393,7 @@ private:
   void serializeImpl(VariableSerializer *serializer) const;
   friend size_t getMemSize(const ArrayData*);
   static void compileTimeAssertions() {
-    static_assert(offsetof(ArrayData, m_kind) == HeaderKindOffset, "");
-    static_assert(offsetof(ArrayData, m_count) == FAST_REFCOUNT_OFFSET, "");
+    static_assert(offsetof(ArrayData, m_hdr) == HeaderOffset, "");
   }
 
 protected:
@@ -430,24 +431,7 @@ protected:
     };
     uint64_t m_sizeAndPos; // careful, m_pos is signed
   };
-  union {
-    struct {
-      union {
-        struct {
-          UNUSED uint16_t m_unused1;
-          UNUSED uint8_t m_unused0;
-          ArrayKind m_kind;
-        };
-        // Packed arrays overlay their encoded capacity with the kind field.
-        // kPackedKind is zero, and aliases the top byte of m_packedCapCode,
-        // so it won't influence the encoded capacity. For details on the
-        // encoding see the definition of packedCapToCode().
-        uint32_t m_packedCapCode;
-      };
-      mutable RefCount m_count;
-    };
-    uint64_t m_kindAndCount;
-  };
+  HeaderWord<CapCode> m_hdr;
 };
 
 static_assert(ArrayData::kPackedKind == uint8_t(HeaderKind::Packed), "");
@@ -481,7 +465,7 @@ ALWAYS_INLINE ArrayData* staticEmptyArray() {
  * ArrayFunctions is a hand-built virtual dispatch table.  Each field represents
  * one virtual method with an array of function pointers, one per ArrayKind.
  * There is one global instance of this table.  Arranging it this way allows
- * dispatch to be done with a single indexed load, using m_kind as the index.
+ * dispatch to be done with a single indexed load, using kind as the index.
  */
 struct ArrayFunctions {
   // NK stands for number of array kinds; here just for shorthand.
@@ -517,7 +501,7 @@ struct ArrayFunctions {
   ssize_t (*iterRewind[NK])(const ArrayData*, ssize_t pos);
   bool (*validMArrayIter[NK])(const ArrayData*, const MArrayIter&);
   bool (*advanceMArrayIter[NK])(ArrayData*, MArrayIter&);
-  ArrayData* (*escalateForSort[NK])(ArrayData*);
+  ArrayData* (*escalateForSort[NK])(ArrayData*, SortFunction);
   void (*ksort[NK])(ArrayData* ad, int sort_flags, bool ascending);
   void (*sort[NK])(ArrayData* ad, int sort_flags, bool ascending);
   void (*asort[NK])(ArrayData* ad, int sort_flags, bool ascending);

@@ -22,6 +22,7 @@
 #include "hphp/runtime/server/satellite-server.h"
 #include "hphp/runtime/server/server-task-event.h"
 #include "hphp/runtime/server/transport.h"
+#include "hphp/util/synchronizable.h"
 
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
@@ -103,10 +104,9 @@ public:
   virtual const char *getUrl();
   virtual const char *getRemoteHost() { return "127.0.0.1"; }
   virtual uint16_t getRemotePort() { return 0; }
-  virtual const char *getServerAddr() {
-    return RuntimeOption::ServerPrimaryIPv4.empty() ?
-      RuntimeOption::ServerPrimaryIPv6.c_str() :
-      RuntimeOption::ServerPrimaryIPv4.c_str();
+  virtual const std::string& getServerAddr() {
+    auto const& ipv4 = RuntimeOption::GetServerPrimaryIPv4();
+    return ipv4.empty() ? RuntimeOption::GetServerPrimaryIPv6() : ipv4;
   }
 
   /**
@@ -126,7 +126,8 @@ public:
   virtual void addHeaderImpl(const char *name, const char *value) {}
   virtual void removeHeaderImpl(const char *name) {}
 
-  virtual void sendImpl(const void *data, int size, int code, bool chunked);
+  virtual void sendImpl(const void *data, int size, int code, bool chunked,
+                        bool eom);
   virtual void onSendEndImpl();
 
   /**
@@ -152,6 +153,8 @@ public:
   }
 
 private:
+  template <typename F> friend void scan(const XboxTransport&, F&);
+
   std::atomic<int> m_refCount;
 
   std::string m_message;

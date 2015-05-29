@@ -79,26 +79,27 @@ void ReplayTransport::replayInput(Hdf hdf) {
 }
 
 void ReplayTransport::replayInputImpl() {
-  String postData = StringUtil::UUDecode(Config::Get(m_ini, m_hdf["post"], ""));
+  String postData = StringUtil::UUDecode(Config::Get(m_ini, m_hdf, "post", "",
+                                                     false));
   m_postData = std::string(postData.data(), postData.size());
   m_requestHeaders.clear();
   for (Hdf hdf = m_hdf["headers"].firstChild(); hdf.exists();
        hdf = hdf.next()) {
-    m_requestHeaders[Config::Get(m_ini, hdf["name"], "")].push_back(
-      Config::Get(m_ini, hdf["value"], "")
+    m_requestHeaders[Config::Get(m_ini, hdf, "name", "", false)].push_back(
+      Config::Get(m_ini, hdf, "value", "", false)
     );
   }
 }
 
 const char *ReplayTransport::getUrl() {
-  return Config::Get(m_ini, m_hdf["url"], "");
+  return Config::Get(m_ini, m_hdf, "url", "", false);
 }
 
 const char *ReplayTransport::getRemoteHost() {
-  return Config::Get(m_ini, m_hdf["remote_host"], "");
+  return Config::Get(m_ini, m_hdf, "remote_host", "", false);
 }
 uint16_t ReplayTransport::getRemotePort() {
-  return Config::GetUInt16(m_ini, m_hdf["remote_port"], 0);
+  return Config::GetUInt16(m_ini, m_hdf, "remote_port", 0, false);
 }
 
 const void *ReplayTransport::getPostData(int &size) {
@@ -107,7 +108,7 @@ const void *ReplayTransport::getPostData(int &size) {
 }
 
 Transport::Method ReplayTransport::getMethod() {
-  return (Transport::Method)Config::GetInt32(m_ini, m_hdf["cmd"]);
+  return (Transport::Method)Config::GetInt32(m_ini, m_hdf, "cmd", false);
 }
 
 std::string ReplayTransport::getHeader(const char *name) {
@@ -134,7 +135,7 @@ void ReplayTransport::removeHeaderImpl(const char *name) {
 }
 
 void ReplayTransport::sendImpl(const void *data, int size, int code,
-                               bool chunked) {
+                               bool chunked, bool eom) {
   m_code = code;
 
   m_response = "HTTP/1.1 ";
@@ -156,6 +157,9 @@ void ReplayTransport::sendImpl(const void *data, int size, int code,
   m_response += "\r\n";
   m_response.append((const char *)data, size);
   m_response += "\r\n";
+  if (eom) {
+    onSendEndImpl();
+  }
 }
 
 ///////////////////////////////////////////////////////////////////////////////

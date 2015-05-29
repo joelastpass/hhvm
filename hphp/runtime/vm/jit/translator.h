@@ -61,7 +61,7 @@ struct Block;
 struct IRTranslator;
 struct NormalizedInstruction;
 struct ProfData;
-struct HTS;
+struct IRGS;
 
 static const uint32_t transCountersPerChunk = 1024 * 1024 / 8;
 
@@ -109,20 +109,24 @@ using BlockIdToIRBlockMap = hphp_hash_map<RegionDesc::BlockId, Block*>;
  * need access to this.
  */
 struct TransContext {
-  /* The SrcKey for this translation. */
-  SrcKey srcKey() const;
-
-  TransID transID;  // May be kInvalidTransID if not for a real translation.
-  Offset initBcOffset;
-  Offset initSpOffset;
-  bool resumed;
-  const Func* func;
+  TransContext(TransID id, SrcKey sk, FPInvOffset spOff);
 
   /*
-   * If available, the RegionDesc that we're compiling.  Might be
-   * nullptr---only used for debug output.
+   * The SrcKey for this translation.
    */
-  const RegionDesc* regionDesc;
+  SrcKey srcKey() const;
+
+  /*
+   * Data members.
+   *
+   * The contents of SrcKey are re-laid out to avoid func table lookups.
+   */
+  TransID transID;  // May be kInvalidTransID if not for a real translation.
+  FPInvOffset initSpOffset;
+  const Func* func;
+  Offset initBcOffset;
+  bool prologue;
+  bool resumed;
 };
 
 /*
@@ -136,7 +140,6 @@ struct TranslArgs {
 
   SrcKey sk;
   bool align;
-  bool dryRun{false};
   bool setFuncBody{false};
   TransFlags flags{0};
   TransID transId{kInvalidTransID};
@@ -540,35 +543,6 @@ const InstrInfo& getInstrInfo(Op op);
  */
 bool dontGuardAnyInputs(Op op);
 
-
-///////////////////////////////////////////////////////////////////////////////
-// Property information.
-
-struct PropInfo {
-  PropInfo()
-    : offset(-1)
-    , repoAuthType{}
-  {}
-
-  explicit PropInfo(int offset, RepoAuthType repoAuthType)
-    : offset(offset)
-    , repoAuthType{repoAuthType}
-  {}
-
-  int offset;
-  RepoAuthType repoAuthType;
-};
-
-PropInfo getPropertyOffset(const NormalizedInstruction& ni,
-                           const Class* ctx,
-                           const Class*& baseClass,
-                           const MInstrInfo& mii,
-                           unsigned mInd, unsigned iInd);
-
-PropInfo getFinalPropertyOffset(const NormalizedInstruction& ni,
-                                Class* ctx, const MInstrInfo& mii);
-
-
 ///////////////////////////////////////////////////////////////////////////////
 // Other instruction information.
 
@@ -632,19 +606,20 @@ inline bool isNativeImplCall(const Func* funcd, int numArgs) {
 }
 
 /*
- * The offset, in cells, of this location from its base pointer.
- *
- * The Func* is needed to see how many locals to skip for iterators.  If the
- * current frame pointer is not the context you're looking for, be sure to pass
- * in a non-default `f'.
+ * The offset, in cells, of this location from the frame pointer.
  */
-int locPhysicalOffset(Location l, const Func* f = nullptr);
+int locPhysicalOffset(int32_t localIndex);
 
 /*
  * Take a NormalizedInstruction and turn it into a call to the appropriate ht
  * functions.  Updates the bytecode marker, handles interp one flags, etc.
  */
-void translateInstr(HTS&, const NormalizedInstruction&);
+void translateInstr(
+  IRGS&,
+  const NormalizedInstruction&,
+  bool checkOuterTypeOnly,
+  bool needsExitPlaceholder
+);
 
 extern bool tc_dump();
 

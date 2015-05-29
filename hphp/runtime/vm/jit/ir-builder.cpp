@@ -15,22 +15,25 @@
 */
 
 #include "hphp/runtime/vm/jit/ir-builder.h"
+
 #include <algorithm>
 #include <utility>
 
 #include <folly/ScopeGuard.h>
 
+#include "hphp/util/assertions.h"
 #include "hphp/util/trace.h"
-#include "hphp/runtime/vm/jit/ir-unit.h"
-#include "hphp/runtime/vm/jit/guard-relaxation.h"
-#include "hphp/runtime/vm/jit/mutation.h"
-#include "hphp/runtime/vm/jit/timer.h"
-#include "hphp/runtime/vm/jit/translator.h"
-#include "hphp/runtime/vm/jit/print.h"
-#include "hphp/runtime/vm/jit/punt.h"
+
 #include "hphp/runtime/base/rds.h"
 #include "hphp/runtime/vm/jit/analysis.h"
-#include "hphp/util/assertions.h"
+#include "hphp/runtime/vm/jit/guard-relaxation.h"
+#include "hphp/runtime/vm/jit/ir-unit.h"
+#include "hphp/runtime/vm/jit/mutation.h"
+#include "hphp/runtime/vm/jit/print.h"
+#include "hphp/runtime/vm/jit/punt.h"
+#include "hphp/runtime/vm/jit/simplify.h"
+#include "hphp/runtime/vm/jit/timer.h"
+#include "hphp/runtime/vm/jit/translator.h"
 
 namespace HPHP { namespace jit {
 
@@ -52,7 +55,7 @@ const typename M::mapped_type& get_required(const M& m,
 SSATmp* fwdGuardSource(IRInstruction* inst) {
   if (inst->is(AssertType, CheckType)) return inst->src(0);
 
-  assert(inst->is(AssertLoc, CheckLoc, AssertStk, CheckStk));
+  assertx(inst->is(AssertLoc, CheckLoc, AssertStk, CheckStk));
   inst->convertToNop();
   return nullptr;
 }
@@ -71,7 +74,6 @@ IRBuilder::IRBuilder(IRUnit& unit, BCMarker initMarker)
 {
   m_state.setBuilding();
   if (RuntimeOption::EvalHHIRGenOpts) {
-    m_enableCse = false; // CSE is disabled at gen time.
     m_enableSimplification = RuntimeOption::EvalHHIRSimplification;
   }
 }
@@ -98,10 +100,15 @@ void IRBuilder::appendInstruction(IRInstruction* inst) {
         m_constraints.prevTypes[inst] = localType(locId, DataTypeGeneric);
       }
     }
-    if (inst->is(AssertStk, CheckStk, LdStk)) {
-      auto const offset = inst->extra<StackOffset>()->offset;
+    if (inst->is(CheckStk)) {
+      auto const offset = inst->extra<RelOffsetData>()->irSpOffset;
       m_constraints.typeSrcs[inst] = stackTypeSources(offset);
-      if (inst->is(AssertStk, CheckStk)) {
+      m_constraints.prevTypes[inst] = stackType(offset, DataTypeGeneric);
+    }
+    if (inst->is(AssertStk, LdStk)) {
+      auto const offset = inst->extra<IRSPOffsetData>()->offset;
+      m_constraints.typeSrcs[inst] = stackTypeSources(offset);
+      if (inst->is(AssertStk)) {
         m_constraints.prevTypes[inst] = stackType(offset, DataTypeGeneric);
       }
     }
@@ -115,8 +122,7 @@ void IRBuilder::appendInstruction(IRInstruction* inst) {
     // In psuedomains we have to pre-constrain local guards, because we don't
     // ever actually generate code that will constrain them otherwise.
     // (Because of the LdLocPseudoMain stuff.)
-    if (inst->marker().func()->isPseudoMain() &&
-        inst->is(GuardLoc, CheckLoc)) {
+    if (inst->marker().func()->isPseudoMain() && inst->is(CheckLoc)) {
       constrainGuard(inst, DataTypeSpecific);
     }
   }
@@ -130,7 +136,7 @@ void IRBuilder::appendInstruction(IRInstruction* inst) {
     auto& prev = *prevIt;
 
     if (prev.isBlockEnd()) {
-      assert(where == m_curBlock->end());
+      assertx(where == m_curBlock->end());
 
       auto oldBlock = m_curBlock;
 
@@ -145,7 +151,7 @@ void IRBuilder::appendInstruction(IRInstruction* inst) {
 
       m_state.finishBlock(oldBlock);
 
-      m_state.startBlock(m_curBlock, inst->marker());
+      m_state.startBlock(m_curBlock);
       where = m_curBlock->begin();
 
       FTRACE(2, "lazily adding B{}\n", m_curBlock->id());
@@ -153,23 +159,24 @@ void IRBuilder::appendInstruction(IRInstruction* inst) {
     }
   }
 
-  assert(IMPLIES(inst->isBlockEnd(), where == m_curBlock->end()) &&
+  assertx(IMPLIES(inst->isBlockEnd(), where == m_curBlock->end()) &&
          "Can't insert a BlockEnd instruction in the middle of a block");
   if (do_assert && where != m_curBlock->begin()) {
     UNUSED auto prevIt = where;
     --prevIt;
-    assert(!prevIt->isBlockEnd() &&
+    assertx(!prevIt->isBlockEnd() &&
            "Can't append an instruction after a BlockEnd instruction");
   }
 
-  assert(inst->marker().valid());
+  assertx(inst->marker().valid());
   if (!inst->is(Nop, DefConst)) {
     where = m_curBlock->insert(where, inst);
     ++where;
   }
 
   m_state.update(inst);
-  cseUpdate(*inst);
+
+  if (inst->isTerminal()) m_state.finishBlock(m_curBlock);
 }
 
 void IRBuilder::appendBlock(Block* block) {
@@ -177,7 +184,7 @@ void IRBuilder::appendBlock(Block* block) {
 
   FTRACE(2, "appending B{}\n", block->id());
   // Load up the state for the new block.
-  m_state.startBlock(block, m_curMarker);
+  m_state.startBlock(block);
   m_curBlock = block;
 }
 
@@ -198,7 +205,7 @@ Block* IRBuilder::guardFailBlock() const {
 SSATmp* IRBuilder::preOptimizeCheckTypeOp(IRInstruction* inst, Type oldType) {
   auto const typeParam = inst->typeParam();
 
-  if (oldType.not(typeParam)) {
+  if (!oldType.maybe(typeParam)) {
     /* This check will always fail. It's probably due to an incorrect
      * prediction. Generate a Jmp and return the src. The fact that the type
      * will be slightly off is ok because all the code after the Jmp is
@@ -207,7 +214,7 @@ SSATmp* IRBuilder::preOptimizeCheckTypeOp(IRInstruction* inst, Type oldType) {
     return fwdGuardSource(inst);
   }
 
-  auto const newType = refineType(oldType, inst->typeParam());
+  auto const newType = oldType & inst->typeParam();
 
   if (oldType <= newType) {
     /* The type of the src is the same or more refined than type, so the guard
@@ -218,12 +225,8 @@ SSATmp* IRBuilder::preOptimizeCheckTypeOp(IRInstruction* inst, Type oldType) {
   return nullptr;
 }
 
-SSATmp* IRBuilder::preOptimizeCheckType(IRInstruction* inst) {
-  return preOptimizeCheckTypeOp(inst, inst->src(0)->type());
-}
-
 SSATmp* IRBuilder::preOptimizeCheckStk(IRInstruction* inst) {
-  auto const offset = inst->extra<CheckStk>()->offset;
+  auto const offset = inst->extra<CheckStk>()->irSpOffset;
 
   if (auto const prevValue = stackValue(offset, DataTypeGeneric)) {
     gen(CheckType, inst->typeParam(), inst->taken(), prevValue);
@@ -254,7 +257,7 @@ SSATmp* IRBuilder::preOptimizeCheckLoc(IRInstruction* inst) {
 
 SSATmp* IRBuilder::preOptimizeHintLocInner(IRInstruction* inst) {
   auto const locId = inst->extra<HintLocInner>()->locId;
-  if (!localType(locId, DataTypeGeneric).subtypeOf(Type::BoxedCell) ||
+  if (!(localType(locId, DataTypeGeneric) <= TBoxedCell) ||
       predictedInnerType(locId).box() <= inst->typeParam()) {
     inst->convertToNop();
     return nullptr;
@@ -270,62 +273,20 @@ SSATmp* IRBuilder::preOptimizeAssertTypeOp(IRInstruction* inst,
          *inst, oldType,
          oldVal ? oldVal->toString() : "nullptr",
          typeSrc ? typeSrc->toString() : "nullptr");
-  auto const typeParam = inst->typeParam();
 
-  if (oldType.not(typeParam)) {
-    // If both types are boxed this is ok and even expected as a means to
-    // update the hint for the inner type.
-    if (oldType.isBoxed() && typeParam.isBoxed()) return nullptr;
-
-    // We got external information (probably from static analysis) that
-    // conflicts with what we've built up so far. There's no reasonable way to
-    // continue here: we can't properly fatal the request because we can't make
-    // a catch trace or SpillStack without HhbcTranslator, we can't punt on
-    // just this instruction because we might not be in the initial translation
-    // phase, and we can't just plow on forward since we'll probably generate
-    // malformed IR. Since this case is very rare, just punt on the whole trace
-    // so it gets interpreted.
-    TRACE_PUNT("Invalid AssertTypeOp");
+  if (canSimplifyAssertType(inst, oldType, typeMightRelax(oldVal))) {
+    return fwdGuardSource(inst);
   }
 
-  // Asserting in these situations doesn't add any information.
-  if (typeParam == Type::Cls && oldType <= Type::Cls) return inst->src(0);
-  if (typeParam == Type::Gen && oldType <= Type::Gen) return inst->src(0);
+  auto const newType = oldType & inst->typeParam();
 
-  auto const newType = refineType(oldType, typeParam);
-
-  if (oldType <= newType) {
-    // oldType is at least as good as the new type. Eliminate this
-    // AssertTypeOp, but only if the src type won't relax, or the source value
-    // is another assert that's good enough. We do this to avoid eliminating
-    // apparently redundant assert opcodes that may become useful after prior
-    // guards are relaxed.
-    if (!typeMightRelax(oldVal) ||
-        (typeSrc && typeSrc->is(AssertType, AssertLoc, AssertStk) &&
-         typeSrc->typeParam() <= inst->typeParam())) {
-      return fwdGuardSource(inst);
-    }
-
-    if (oldType < newType) {
-      // This can happen because of limitations in how Type::operator& (used in
-      // refinedType()) handles specialized types: sometimes it returns a Type
-      // that's wider than it could be. It shouldn't affect correctness but it
-      // can cause us to miss out on some perf.
-      ITRACE(1, "Suboptimal AssertTypeOp: refineType({}, {}) -> {} in {}\n",
-             oldType, typeParam, newType, *inst);
-
-      // We don't currently support intersecting RepoAuthType::Arrays
-      // (t4473238), so we might be here because oldType and typeParam have
-      // different RATArrays. If that's the case and typeParam provides no
-      // other useful information we can unconditionally eliminate this
-      // instruction: RATArrays never come from guards so we can't miss out on
-      // anything by doing so.
-      if (oldType < Type::Arr && oldType.getArrayType() &&
-          typeParam < Type::Arr && typeParam.getArrayType() &&
-          !typeParam.hasArrayKind()) {
-        return fwdGuardSource(inst);
-      }
-    }
+  // Eliminate this AssertTypeOp if the source value is another assert that's
+  // good enough.
+  if (oldType <= newType &&
+      typeSrc &&
+      typeSrc->is(AssertType, AssertLoc, AssertStk) &&
+      typeSrc->typeParam() <= inst->typeParam()) {
+    return fwdGuardSource(inst);
   }
 
   return nullptr;
@@ -405,7 +366,7 @@ SSATmp* IRBuilder::preOptimizeLdCtx(IRInstruction* inst) {
   if (func->isStatic()) {
     if (fpInst->is(DefInlineFP)) {
       auto const ctx = fpInst->extra<DefInlineFP>()->ctx;
-      if (ctx->isConst(Type::Cls)) {
+      if (ctx->hasConstVal(TCls)) {
         inst->convertToNop();
         return m_unit.cns(ConstCctx::cctx(ctx->clsVal()));
       }
@@ -424,24 +385,9 @@ SSATmp* IRBuilder::preOptimizeLdCtx(IRInstruction* inst) {
     // check that we haven't nuked the SSATmp
     if (!m_state.frameMaySpanCall()) {
       auto const ctx = fpInst->extra<DefInlineFP>()->ctx;
-      if (ctx->isA(Type::Obj)) return ctx;
+      if (ctx->isA(TObj)) return ctx;
     }
   }
-  return nullptr;
-}
-
-SSATmp* IRBuilder::preOptimizeDecRefThis(IRInstruction* inst) {
-  /*
-   * If $this is available, convert to an instruction sequence that doesn't
-   * need to test $this is available.  (Hopefully we CSE the load, too.)
-   */
-  if (thisAvailable()) {
-    auto const ctx   = gen(LdCtx, m_state.fp());
-    auto const thiss = gen(CastCtxThis, ctx);
-    gen(DecRef, thiss);
-    inst->convertToNop();
-  }
-
   return nullptr;
 }
 
@@ -452,57 +398,20 @@ SSATmp* IRBuilder::preOptimizeLdLoc(IRInstruction* inst) {
   auto const type = localType(locId, DataTypeGeneric);
 
   // The types may not be compatible in the presence of unreachable code.
-  // Don't try to optimize the code in this case, and just let
-  // unreachable code elimination take care of it later.
-  if (type.not(inst->typeParam())) return nullptr;
-
+  // Unreachable code elimination will take care of it later.
+  if (!type.maybe(inst->typeParam())) {
+    inst->setTypeParam(TBottom);
+    return nullptr;
+  }
   // If FrameStateMgr's type isn't as good as the type param, we're missing
   // information in the IR.
-  assert(inst->typeParam() >= type);
+  assertx(inst->typeParam() >= type);
   inst->setTypeParam(std::min(type, inst->typeParam()));
 
   if (typeMightRelax()) return nullptr;
-  if (inst->typeParam().isConst()) {
+  if (inst->typeParam().hasConstVal() ||
+      inst->typeParam().subtypeOfAny(TUninit, TInitNull)) {
     return m_unit.cns(inst->typeParam());
-  }
-
-  return nullptr;
-}
-
-SSATmp* IRBuilder::preOptimizeStLoc(IRInstruction* inst) {
-  // Guard relaxation might change the current local type, so don't try to
-  // change to StLocNT until after relaxation happens.
-  if (typeMightRelax()) return nullptr;
-
-  auto locId = inst->extra<StLoc>()->locId;
-  auto const curType = localType(locId, DataTypeGeneric);
-  auto const newType = inst->src(1)->type();
-
-  /*
-   * There's no need to store the type if it's going to be the same
-   * KindOfFoo.  We'll still have to store string types because we
-   * aren't specific about storing KindOfStaticString
-   * vs. KindOfString, and a Type::Null might mean KindOfUninit or
-   * KindOfNull.
-   */
-  auto const bothBoxed = curType.isBoxed() && newType.isBoxed();
-  auto const sameUnboxed = [&] {
-    auto avoidable = { Type::Uninit,
-                       Type::InitNull,
-                       Type::Bool,
-                       Type::Int,
-                       Type::Dbl,
-                       // No strings.
-                       Type::Arr,
-                       Type::Obj,
-                       Type::Res };
-    for (auto t : avoidable) {
-      if (curType <= t && newType <= t) return true;
-    }
-    return false;
-  };
-  if (bothBoxed || sameUnboxed()) {
-    inst->setOpcode(StLocNT);
   }
 
   return nullptr;
@@ -518,7 +427,7 @@ SSATmp* IRBuilder::preOptimizeCastStk(IRInstruction* inst) {
     DataTypeGeneric
   );
   if (typeMightRelax(curVal)) return nullptr;
-  if (inst->typeParam() == Type::NullableObj && curType <= Type::Null) {
+  if (inst->typeParam() == TNullableObj && curType <= TNull) {
     // If we're casting Null to NullableObj, we still need to call
     // tvCastToNullableObjectInPlace. See comment there and t3879280 for
     // details.
@@ -550,19 +459,17 @@ SSATmp* IRBuilder::preOptimizeCoerceStk(IRInstruction* inst) {
 
 SSATmp* IRBuilder::preOptimizeLdStk(IRInstruction* inst) {
   auto const offset = inst->extra<LdStk>()->offset;
-  if (auto tmp = stackValue(offset, DataTypeGeneric)) {
-    gen(TakeStk, tmp);
-    return tmp;
-  }
+  if (auto tmp = stackValue(offset, DataTypeGeneric)) return tmp;
   // The types may not be compatible in the presence of unreachable code.
   // Don't try to optimize the code in this case, and just let
   // unreachable code elimination take care of it later.
   auto const type = stackType(offset, DataTypeGeneric);
-  if (type.not(inst->typeParam())) return nullptr;
+  if (!type.maybe(inst->typeParam())) return nullptr;
   inst->setTypeParam(std::min(type, inst->typeParam()));
 
   if (typeMightRelax()) return nullptr;
-  if (inst->typeParam().isConst()) {
+  if (inst->typeParam().hasConstVal() ||
+      inst->typeParam().subtypeOfAny(TUninit, TInitNull)) {
     return m_unit.cns(inst->typeParam());
   }
 
@@ -572,21 +479,18 @@ SSATmp* IRBuilder::preOptimizeLdStk(IRInstruction* inst) {
 SSATmp* IRBuilder::preOptimize(IRInstruction* inst) {
 #define X(op) case op: return preOptimize##op(inst);
   switch (inst->op()) {
-  X(CheckType)
-  X(CheckStk)
-  X(CheckLoc)
   X(HintLocInner)
+  X(AssertType)
   X(AssertLoc)
   X(AssertStk)
-  X(AssertType)
-  X(CheckCtxThis)
-  X(LdCtx)
-  X(DecRefThis)
+  X(CheckStk)
+  X(CheckLoc)
   X(LdLoc)
-  X(StLoc)
+  X(LdStk)
   X(CastStk)
   X(CoerceStk)
-  X(LdStk)
+  X(CheckCtxThis)
+  X(LdCtx)
   default: break;
   }
 #undef X
@@ -596,17 +500,16 @@ SSATmp* IRBuilder::preOptimize(IRInstruction* inst) {
 //////////////////////////////////////////////////////////////////////
 
 /*
- * Performs simplification and CSE on the input instruction. If the input
- * instruction has a dest, this will return an SSATmp that represents the same
- * value as dst(0) of the input instruction. If the input instruction has no
- * dest, this will return nullptr.
+ * Perform preoptimization and simplification on the input instruction.  If the
+ * input instruction has a dest, this will return an SSATmp that represents the
+ * same value as dst(0) of the input instruction.  If the input instruction has
+ * no dest, this will return nullptr.
  *
  * The caller never needs to clone or append; all this has been done.
  */
 SSATmp* IRBuilder::optimizeInst(IRInstruction* inst,
                                 CloneFlag doClone,
-                                Block* srcBlock,
-                                const folly::Optional<IdomVector>& idoms) {
+                                Block* srcBlock) {
   static DEBUG_ONLY __thread int instNest = 0;
   if (debug) ++instNest;
   SCOPE_EXIT { if (debug) --instNest; };
@@ -614,32 +517,10 @@ SSATmp* IRBuilder::optimizeInst(IRInstruction* inst,
 
   FTRACE(1, "optimize: {}\n", inst->toString());
 
-  auto doCse = [&] (IRInstruction* cseInput) -> SSATmp* {
-    if (m_enableCse && cseInput->canCSE()) {
-      if (auto const cseResult = cseLookup(*cseInput, srcBlock, idoms)) {
-        // Found a dominating instruction that can be used instead of input
-        FTRACE(1, "  {}cse found: {}\n",
-               indent(), cseResult->inst()->toString());
-
-        assert(!cseInput->consumesReferences());
-        if (cseInput->producesReference(0)) {
-          // Replace with an IncRef
-          FTRACE(1, "  {}cse of refcount-producing instruction\n", indent());
-          gen(IncRef, cseResult);
-        }
-        return cseResult;
-      }
-    }
-    return nullptr;
-  };
-
   auto cloneAndAppendOriginal = [&] () -> SSATmp* {
     if (inst->op() == Nop) return nullptr;
-    if (auto cseResult = doCse(inst)) {
-      return cseResult;
-    }
     if (doClone == CloneFlag::Yes) {
-      inst = m_unit.cloneInstruction(inst);
+      inst = m_unit.clone(inst);
     }
     appendInstruction(inst);
     return inst->dst(0);
@@ -673,26 +554,18 @@ SSATmp* IRBuilder::optimizeInst(IRInstruction* inst,
   //
   // ([], nullptr): no optimization possible. Use original inst.
   //
-  // ([], non-nullptr): passing through a src. Don't CSE.
+  // ([], non-nullptr): passing through a src.
   //
-  // ([X, ...], Y): throw away input instruction, append 'X, ...' (CSEing
-  //                as we go), return Y.
+  // ([X, ...], Y): throw away input instruction, append 'X, ...',
+  //                return Y.
 
   if (!simpResult.instrs.empty()) {
     // New instructions were generated. Append the new ones, filtering out Nops.
     for (auto* newInst : simpResult.instrs) {
-      assert(!newInst->isTransient());
+      assertx(!newInst->isTransient());
       if (newInst->op() == Nop) continue;
-
-      auto cseResult = doCse(newInst);
-      if (cseResult) {
-        appendInstruction(m_unit.mov(newInst->dst(), cseResult,
-                                     newInst->marker()));
-      } else {
-        appendInstruction(newInst);
-      }
+      appendInstruction(newInst);
     }
-
     return simpResult.dst;
   }
 
@@ -700,9 +573,8 @@ SSATmp* IRBuilder::optimizeInst(IRInstruction* inst,
   // anything, or we're using some other instruction's dst instead of our own.
 
   if (simpResult.dst) {
-    // We're using some other instruction's output. Don't append anything, and
-    // don't do any CSE.
-    assert(simpResult.dst->inst() != inst);
+    // We're using some other instruction's output.  Don't append anything.
+    assertx(simpResult.dst->inst() != inst);
     return simpResult.dst;
   }
 
@@ -711,7 +583,7 @@ SSATmp* IRBuilder::optimizeInst(IRInstruction* inst,
 }
 
 void IRBuilder::prepareForNextHHBC() {
-  assert(
+  assertx(
     syncedSpLevel() + m_state.evalStack().size() - m_state.stackDeficit() ==
       m_curMarker.spOff()
   );
@@ -729,7 +601,7 @@ void IRBuilder::exceptionStackBoundary() {
    * If this assert fires, we're trying to put things on the stack in a catch
    * trace that the unwinder won't be able to see.
    */
-  assert(
+  assertx(
     syncedSpLevel() + m_state.evalStack().size() - m_state.stackDeficit() ==
       m_curMarker.spOff()
   );
@@ -738,135 +610,6 @@ void IRBuilder::exceptionStackBoundary() {
   m_exnStack.stackDeficit  = m_state.stackDeficit();
   m_exnStack.evalStack     = m_state.evalStack();
   m_exnStack.sp            = m_state.sp();
-}
-
-/*
- * reoptimize() runs a trace through a second pass of IRBuilder
- * optimizations, like this:
- *
- *   reset state.
- *   move all blocks to a temporary list.
- *   compute immediate dominators.
- *   for each block in trace order:
- *     if we have a snapshot state for this block:
- *       clear cse entries that don't dominate this block.
- *       use snapshot state.
- *     move all instructions to a temporary list.
- *     for each instruction:
- *       optimizeWork - do CSE and simplify again
- *       if not simplified:
- *         append existing instruction and update state.
- *       else:
- *         if the instruction has a result, insert a mov from the
- *         simplified tmp to the original tmp and discard the instruction.
- *     if the last conditional branch was turned into a jump, remove the
- *     fall-through edge to the next block.
- */
-void IRBuilder::reoptimize() {
-  Timer _t(Timer::optimize_reoptimize);
-  FTRACE(5, "ReOptimize:vvvvvvvvvvvvvvvvvvvv\n");
-  SCOPE_EXIT { FTRACE(5, "ReOptimize:^^^^^^^^^^^^^^^^^^^^\n"); };
-  always_assert(m_savedBlocks.empty());
-
-  if (splitCriticalEdges(m_unit)) {
-    printUnit(6, m_unit, "after splitting critical edges for reoptimize");
-  }
-
-  m_state = FrameStateMgr{m_initialMarker};
-  m_cseHash.clear();
-  m_enableCse = RuntimeOption::EvalHHIRCse;
-  m_enableSimplification = RuntimeOption::EvalHHIRSimplification;
-  if (!m_enableCse && !m_enableSimplification) return;
-  setConstrainGuards(false);
-
-  // We need to use fixed-point for loops, otherwise legacy reoptimize will not
-  // handle the CFG's back-edges correctly.
-  auto const use_fixed_point = RuntimeOption::EvalJitLoops;
-
-  auto blocksIds = rpoSortCfgWithIds(m_unit);
-  auto const idoms = findDominators(m_unit, blocksIds);
-  boost::dynamic_bitset<> reachable(m_unit.numBlocks());
-  reachable.set(m_unit.entry()->id());
-
-  if (use_fixed_point) {
-    m_state.computeFixedPoint(blocksIds);
-  } else {
-    m_state.setLegacyReoptimize();
-  }
-
-  for (auto block : blocksIds.blocks) {
-    ITRACE(5, "reoptimize entering block: {}\n", block->id());
-    Indent _i;
-
-    // Skip block if it's unreachable.
-    if (!reachable.test(block->id())) continue;
-
-    if (use_fixed_point) {
-      m_state.loadBlock(block);
-    } else {
-      m_state.startBlock(block, block->front().marker());
-    }
-    m_curBlock = block;
-
-    auto nextBlock = block->next();
-    auto backMarker = block->back().marker();
-    auto instructions = block->moveInstrs();
-    assert(block->empty());
-    while (!instructions.empty()) {
-      auto* inst = &instructions.front();
-      instructions.pop_front();
-
-      // optimizeWork below may create new instructions, and will use
-      // m_nextMarker to decide where they are. Use the marker from this
-      // instruction.
-      assert(inst->marker().valid());
-      setCurMarker(inst->marker());
-
-      auto const tmp = optimizeInst(inst, CloneFlag::No, block, idoms);
-      SSATmp* dst = inst->dst(0);
-
-      if (dst != tmp) {
-        // The result of optimization has a different destination than the inst.
-        // Generate a mov(tmp->dst) to get result into dst.
-        assert(inst->op() != DefLabel);
-        assert(block->empty() || !block->back().isBlockEnd() || inst->next());
-        auto src = tmp->inst()->is(Mov) ? tmp->inst()->src(0) : tmp;
-        if (inst->next()) {
-          // If the last instruction is a guard, insert the mov on the
-          // fall-through edge (inst->next()).
-          auto nextBlk = inst->next();
-          nextBlk->insert(nextBlk->begin(),
-                          m_unit.mov(dst, src, inst->marker()));
-        } else {
-          appendInstruction(m_unit.mov(dst, src, inst->marker()));
-        }
-      }
-
-      if (inst->block() == nullptr && inst->isBlockEnd()) {
-        // We're not re-adding the block-end instruction. Unset its edges.
-        inst->setTaken(nullptr);
-        inst->setNext(nullptr);
-      }
-    }
-
-    if (block->empty() || !block->back().isBlockEnd()) {
-      // Our block-end instruction was eliminated (most likely a Jmp* converted
-      // to a nop). Replace it with a jump to the next block.
-      appendInstruction(m_unit.gen(Jmp, backMarker, nextBlock));
-    }
-    assert(block->back().isBlockEnd());
-    if (!block->back().isTerminal() && !block->next()) {
-      // We converted the block-end instruction to a different one.
-      // Set its next block appropriately.
-      block->back().setNext(nextBlock);
-    }
-    // Mark successor blocks as reachable.
-    if (block->back().next())  reachable.set(block->back().next()->id());
-    if (block->back().taken()) reachable.set(block->back().taken()->id());
-    if (!use_fixed_point) {
-      m_state.finishBlock(block);
-    }
-  }
 }
 
 /*
@@ -883,7 +626,7 @@ bool IRBuilder::constrainGuard(const IRInstruction* inst, TypeConstraint tc) {
   Indent _i;
 
   auto const changed = guard != newTc;
-  if (!tc.weak) guard = newTc;
+  if (changed && !tc.weak) guard = newTc;
 
   return changed;
 }
@@ -912,7 +655,7 @@ bool IRBuilder::constrainValue(SSATmp* const val, TypeConstraint tc) {
     // use it to track down the guard.
 
     always_assert_flog(m_constraints.typeSrcs.count(inst),
-                       "No typeSrcs found for {}\n\n{}", *inst, m_unit);
+                       "No typeSrcs found for {}", *inst);
 
     auto const typeSrcs = get_required(m_constraints.typeSrcs, inst);
 
@@ -920,16 +663,16 @@ bool IRBuilder::constrainValue(SSATmp* const val, TypeConstraint tc) {
     for (auto typeSrc : typeSrcs) {
       if (typeSrc.isGuard()) {
         if (inst->is(LdLoc)) {
-          changed = constrainSlot(inst->extra<LdLoc>()->locId, typeSrc, tc,
-                                  "constrainValueLoc") || changed;
+          changed = constrainSlot(inst->extra<LdLoc>()->locId, typeSrc,
+            tc, "constrainValueLoc") || changed;
         } else {
-          assert(inst->is(LdStk));
-          changed = constrainSlot(inst->extra<LdStk>()->offset, typeSrc, tc,
-                                  "constrainValueStk") || changed;
+          assertx(inst->is(LdStk));
+          changed = constrainSlot(inst->extra<LdStk>()->offset.offset, typeSrc,
+            tc, "constrainValueStk") || changed;
         }
       } else {
         // Keep chasing down the source of val.
-        assert(typeSrc.isValue());
+        assertx(typeSrc.isValue());
         changed = constrainValue(typeSrc.value, tc) || changed;
       }
     }
@@ -937,7 +680,7 @@ bool IRBuilder::constrainValue(SSATmp* const val, TypeConstraint tc) {
   }
 
   if (inst->is(AssertType)) {
-    // Sometimes code in HhbcTranslator asks for a value with DataTypeSpecific
+    // Sometimes code in irgen asks for a value with DataTypeSpecific
     // but can tolerate a less specific value. If that happens, there's nothing
     // to constrain.
     if (!typeFitsConstraint(val->type(), tc)) return false;
@@ -953,7 +696,7 @@ bool IRBuilder::constrainValue(SSATmp* const val, TypeConstraint tc) {
   }
 
   if (inst->is(CheckType)) {
-    // Sometimes code in HhbcTranslator asks for a value with DataTypeSpecific
+    // Sometimes code in irgen asks for a value with DataTypeSpecific
     // but can tolerate a less specific value. If that happens, there's nothing
     // to constrain.
     if (!typeFitsConstraint(val->type(), tc)) return false;
@@ -991,9 +734,9 @@ bool IRBuilder::constrainValue(SSATmp* const val, TypeConstraint tc) {
     for (; dst < inst->numDsts(); dst++) {
       if (val == inst->dst(dst)) break;
     }
-    assert(dst != inst->numDsts());
+    assertx(dst != inst->numDsts());
     for (auto& pred : inst->block()->preds()) {
-      assert(pred.inst()->is(Jmp));
+      assertx(pred.inst()->is(Jmp));
       auto src = pred.inst()->src(dst);
       changed = constrainValue(src, tc) || changed;
     }
@@ -1017,11 +760,11 @@ bool IRBuilder::constrainLocal(uint32_t locId,
   return changed;
 }
 
-bool IRBuilder::constrainStack(int32_t offset, TypeConstraint tc) {
+bool IRBuilder::constrainStack(IRSPOffset offset, TypeConstraint tc) {
   if (!shouldConstrainGuards() || tc.empty()) return false;
   auto changed = false;
   for (auto typeSrc : stackTypeSources(offset)) {
-    changed = constrainSlot(offset, typeSrc, tc, "Stk") || changed;
+    changed = constrainSlot(offset.offset, typeSrc, tc, "Stk") || changed;
   }
   return changed;
 }
@@ -1039,20 +782,15 @@ bool IRBuilder::constrainSlot(int32_t idOrOffset,
 
   if (typeSrc.isValue()) return constrainValue(typeSrc.value, tc);
 
-  assert(typeSrc.isGuard());
+  assertx(typeSrc.isGuard());
   auto const guard = typeSrc.guard;
-
-  if (guard->is(GuardLoc, GuardStk)) {
-    ITRACE(2, "found guard to constrain\n");
-    return constrainGuard(guard, tc);
-  }
 
   always_assert(guard->is(AssertLoc, CheckLoc, AssertStk, CheckStk));
 
   // If the dest of the Assert/Check doesn't fit tc there's no point in
   // continuing.
   auto prevType = get_required(m_constraints.prevTypes, guard);
-  if (!typeFitsConstraint(refineType(prevType, guard->typeParam()), tc)) {
+  if (!typeFitsConstraint(prevType & guard->typeParam(), tc)) {
     return false;
   }
 
@@ -1105,14 +843,18 @@ Type IRBuilder::localType(uint32_t id, TypeConstraint tc) {
 
 Type IRBuilder::predictedInnerType(uint32_t id) {
   auto const ty = m_state.predictedLocalType(id);
-  assert(ty.isBoxed());
+  assertx(ty <= TBoxedCell);
   return ldRefReturn(ty.unbox());
 }
 
-Type IRBuilder::stackInnerTypePrediction(int32_t offset) const {
+Type IRBuilder::stackInnerTypePrediction(IRSPOffset offset) const {
   auto const ty = m_state.predictedStackType(offset);
-  assert(ty.isBoxed());
+  assertx(ty <= TBoxedCell);
   return ldRefReturn(ty.unbox());
+}
+
+Type IRBuilder::predictedStackType(IRSPOffset offset) {
+  return m_state.predictedStackType(offset);
 }
 
 Type IRBuilder::predictedLocalType(uint32_t id) {
@@ -1124,13 +866,13 @@ SSATmp* IRBuilder::localValue(uint32_t id, TypeConstraint tc) {
   return m_state.localValue(id);
 }
 
-SSATmp* IRBuilder::stackValue(int32_t offset, TypeConstraint tc) {
+SSATmp* IRBuilder::stackValue(IRSPOffset offset, TypeConstraint tc) {
   auto const val = m_state.stackValue(offset);
   if (val) constrainValue(val, tc);
   return val;
 }
 
-Type IRBuilder::stackType(int32_t offset, TypeConstraint tc) {
+Type IRBuilder::stackType(IRSPOffset offset, TypeConstraint tc) {
   constrainStack(offset, tc);
   return m_state.stackType(offset);
 }
@@ -1140,20 +882,23 @@ void IRBuilder::setCurMarker(BCMarker newMarker) {
   FTRACE(2, "IRBuilder changing current marker from {} to {}\n",
          m_curMarker.valid() ? m_curMarker.show() : "<invalid>",
          newMarker.show());
-  assert(newMarker.valid());
+  assertx(newMarker.valid());
   m_curMarker = newMarker;
 }
 
-bool IRBuilder::startBlock(Block* block, const BCMarker& marker,
-                           bool isLoopHeader) {
-  assert(block);
-  assert(m_savedBlocks.empty());  // No bytecode control flow in exits.
+bool IRBuilder::canStartBlock(Block* block) const {
+  return m_state.hasStateFor(block);
+}
+
+bool IRBuilder::startBlock(Block* block, bool hasUnprocessedPred) {
+  assertx(block);
+  assertx(m_savedBlocks.empty());  // No bytecode control flow in exits.
 
   if (block == m_curBlock) return true;
 
-  // Return false if we don't have a state for block. This can happen
-  // when trying to start a region block that turned out to be unreachable.
-  if (!m_state.hasStateFor(block)) return false;
+  // Return false if we don't have a FrameState saved for `block' yet
+  // -- meaning it isn't reachable from the entry block yet.
+  if (!canStartBlock(block)) return false;
 
   // There's no reason for us to be starting on the entry block when it's not
   // our current block.
@@ -1166,8 +911,8 @@ bool IRBuilder::startBlock(Block* block, const BCMarker& marker,
   m_state.finishBlock(m_curBlock);
   m_curBlock = block;
 
-  m_state.startBlock(m_curBlock, marker, isLoopHeader);
-  if (sp() == nullptr) gen(DefSP, StackOffset{spOffset()}, fp());
+  m_state.startBlock(m_curBlock, hasUnprocessedPred);
+  always_assert(sp() != nullptr);
   always_assert(fp() != nullptr);
 
   FTRACE(2, "IRBuilder switching to block B{}: {}\n", block->id(),
@@ -1178,7 +923,7 @@ bool IRBuilder::startBlock(Block* block, const BCMarker& marker,
 Block* IRBuilder::makeBlock(Offset offset) {
   auto it = m_offsetToBlockMap.find(offset);
   if (it == m_offsetToBlockMap.end()) {
-    auto* block = m_unit.defBlock();
+    auto const block = m_unit.defBlock();
     m_offsetToBlockMap.insert(std::make_pair(offset, block));
     return block;
   }
@@ -1194,33 +939,33 @@ bool IRBuilder::hasBlock(Offset offset) const {
 }
 
 void IRBuilder::setBlock(Offset offset, Block* block) {
-  assert(!hasBlock(offset));
+  assertx(!hasBlock(offset));
   m_offsetToBlockMap[offset] = block;
 }
 
 void IRBuilder::pushBlock(BCMarker marker, Block* b) {
   FTRACE(2, "IRBuilder saving {}@{} and using {}@{}\n",
          m_curBlock, m_curMarker.show(), b, marker.show());
-  assert(b);
+  assertx(b);
 
   m_savedBlocks.push_back(
     BlockState { m_curBlock, m_curMarker, m_exnStack }
   );
   m_state.pauseBlock(m_curBlock);
-  m_state.startBlock(b, marker);
+  m_state.startBlock(b);
   m_curBlock = b;
   m_curMarker = marker;
 
   if (do_assert) {
     for (UNUSED auto const& state : m_savedBlocks) {
-      assert(state.block != b &&
+      assertx(state.block != b &&
              "Can't push a block that's already in the saved stack");
     }
   }
 }
 
 void IRBuilder::popBlock() {
-  assert(!m_savedBlocks.empty());
+  assertx(!m_savedBlocks.empty());
 
   auto const& top = m_savedBlocks.back();
   FTRACE(2, "IRBuilder popping {}@{} to restore {}@{}\n",
@@ -1231,54 +976,6 @@ void IRBuilder::popBlock() {
   m_curMarker = top.marker;
   m_exnStack = top.exnStack;
   m_savedBlocks.pop_back();
-}
-
-//////////////////////////////////////////////////////////////////////
-
-CSEHash& IRBuilder::cseHashTable(const IRInstruction& inst) {
-  return inst.is(DefConst) ? m_unit.constTable() : m_cseHash;
-}
-
-const CSEHash& IRBuilder::cseHashTable(const IRInstruction& inst) const {
-  return const_cast<IRBuilder*>(this)->cseHashTable(inst);
-}
-
-SSATmp* IRBuilder::cseLookup(const IRInstruction& inst,
-                             const Block* srcBlock,
-                             const folly::Optional<IdomVector>& idoms) const {
-  auto tmp = cseHashTable(inst).lookup(const_cast<IRInstruction*>(&inst));
-  if (tmp && idoms) {
-    // During a reoptimize pass, we need to make sure that any values we want
-    // to reuse for CSE are only reused in blocks dominated by the block that
-    // defines it.
-    if (tmp->inst()->is(DefConst)) return tmp;
-    auto const dom = findDefiningBlock(tmp);
-    if (!dom || !dominates(dom, srcBlock, *idoms)) return nullptr;
-  }
-  return tmp;
-}
-
-void IRBuilder::cseUpdate(const IRInstruction& inst) {
-  switch (inst.op()) {
-  case Call:
-  case CallArray:
-  case ContEnter:
-    m_cseHash.clear();
-    break;
-  default:
-    break;
-  }
-
-  if (m_enableCse && inst.canCSE()) {
-    cseHashTable(inst).insert(inst.dst());
-  }
-  if (inst.killsSources()) {
-    for (auto i = uint32_t{0}; i < inst.numSrcs(); ++i) {
-      if (inst.killsSource(i) && inst.src(i)->inst()->canCSE()) {
-        cseHashTable(inst).erase(inst.src(i));
-      }
-    }
-  }
 }
 
 //////////////////////////////////////////////////////////////////////

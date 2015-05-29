@@ -28,6 +28,7 @@
 #include "hphp/runtime/base/countable.h"
 #include "hphp/runtime/base/bstring.h"
 #include "hphp/runtime/base/exceptions.h"
+#include "hphp/runtime/base/cap-code.h"
 
 namespace HPHP {
 
@@ -156,8 +157,9 @@ struct StringData {
   static StringData* MakeEmpty();
 
   /*
-   * Offset accessor for the JIT compiler.
+   * Offset accessors for the JIT compiler.
    */
+  static constexpr ptrdiff_t dataOff() { return offsetof(StringData, m_data); }
   static constexpr ptrdiff_t sizeOff() { return offsetof(StringData, m_len); }
 
   /*
@@ -191,7 +193,6 @@ struct StringData {
    * Reference-counting related.
    */
   IMPLEMENT_COUNTABLE_METHODS_NO_STATIC
-  void setRefCount(RefCount n);
   bool isStatic() const;
   bool isUncounted() const;
 
@@ -429,6 +430,14 @@ struct StringData {
    */
   void dump() const;
 
+  static StringData* node2str(StringDataNode* node) {
+    return reinterpret_cast<StringData*>(
+      uintptr_t(node) - offsetof(SharedPayload, node)
+                   - sizeof(StringData)
+    );
+  }
+  bool isShared() const;
+
 private:
   struct SharedPayload {
     StringDataNode node;
@@ -449,7 +458,6 @@ private:
   const SharedPayload* sharedPayload() const;
   SharedPayload* sharedPayload();
 
-  bool isShared() const;
   bool isFlat() const;
   bool isImmutable() const;
 
@@ -460,9 +468,9 @@ private:
   void delist();
   void incrementHelper();
   bool checkSane() const;
-  void preCompute() const;
-  void setStatic() const;
-  void setUncounted() const;
+  void preCompute();
+  void setStatic();
+  void setUncounted();
 
 private:
   char* m_data;
@@ -470,16 +478,7 @@ private:
   // We have the next fields blocked into qword-size unions so
   // StringData initialization can do fewer stores to initialize the
   // fields.  (gcc does not combine the stores itself.)
-  union {
-    struct {
-      union {
-        struct { char m_pad[3]; HeaderKind m_kind; };
-        uint32_t m_capCode;
-      };
-      mutable RefCount m_count;
-    };
-    uint64_t m_capAndCount;
-  };
+  HeaderWord<CapCode> m_hdr;
   union {
     struct {
       uint32_t m_len;

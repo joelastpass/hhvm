@@ -18,7 +18,7 @@
 #ifndef incl_HPHP_EXT_STREAM_H_
 #define incl_HPHP_EXT_STREAM_H_
 
-#include "hphp/runtime/base/base-includes.h"
+#include "hphp/runtime/ext/extension.h"
 
 namespace HPHP {
 
@@ -199,7 +199,7 @@ Variant HHVM_FUNCTION(stream_select,
 
 Object HHVM_FUNCTION(stream_await,
                      const Resource& stream,
-                     uint16_t events,
+                     int64_t events,
                      double timeout = 0.0);
 
 bool HHVM_FUNCTION(stream_set_blocking,

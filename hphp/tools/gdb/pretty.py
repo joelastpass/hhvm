@@ -16,7 +16,7 @@ from sizeof import sizeof
 #------------------------------------------------------------------------------
 # Legacy iteration.
 
-class _BaseIterator:
+class _BaseIterator(object):
     """Base iterator for Python 2 compatibility (in Python 3, next() is renamed
     to __next__()).  See http://legacy.python.org/dev/peps/pep-3114/.
     """
@@ -30,7 +30,7 @@ class _BaseIterator:
 #------------------------------------------------------------------------------
 # StringData.
 
-class StringDataPrinter:
+class StringDataPrinter(object):
     RECOGNIZE = '^HPHP::StringData$'
 
     def __init__(self, val):
@@ -46,7 +46,7 @@ class StringDataPrinter:
 #------------------------------------------------------------------------------
 # TypedValue.
 
-class TypedValuePrinter:
+class TypedValuePrinter(object):
     RECOGNIZE = '^HPHP::(TypedValue|Cell|Ref|Variant|VarNR)$'
 
     def __init__(self, val):
@@ -93,15 +93,15 @@ class TypedValuePrinter:
             val = data['pref'].dereference()
 
         else:
-            t = "Invalid(%d)" % t.cast(T('int8_t'))
+            t = 'Invalid(%d)' % t.cast(T('int8_t'))
             val = "0x%x" % data['num']
 
         if val is None:
-            out = "{ %s }" % t
+            out = '{ %s }' % t
         elif name is None:
-            out = "{ %s, %s }" % (t, str(val))
+            out = '{ %s, %s }' % (t, str(val))
         else:
-            out = "{ %s, %s (%s) }" % (t, str(val), name)
+            out = '{ %s, %s ("%s") }' % (t, str(val), name)
 
         return out
 
@@ -109,59 +109,67 @@ class TypedValuePrinter:
 #------------------------------------------------------------------------------
 # Pointers.
 
-class PtrPrinter:
-    class _iterator(_BaseIterator):
-        """Pretty printer `children()` iterator for pointer ranges."""
-        def __init__(self, begin, end):
-            self.cur = begin
-            self.end = end
-
-        def __next__(self):
-            if self.cur == self.end:
-                raise StopIteration
-            key = self.cur
-            elt = self.cur.dereference()
-            self.cur = self.cur + 1
-            return ("0x%x" % key.cast(T('long')), elt)
-
+class PtrPrinter(object):
     def _string(self):
         inner = self._pointer().dereference()
         inner_type = rawtype(inner.type)
 
         if inner_type.tag == 'HPHP::StringData':
             return string_data_val(inner)
-        return None
+        return nameof(inner)
 
     def to_string(self):
         s = self._string()
 
-        if s is not None:
-            return '0x%s "%s"' % (str(self._pointer()), s)
-        return self._pointer()
-
-    def children(self):
-        ptr = self._pointer()
-        s = self._string()
-
-        if ptr and s is None:
-            return self._iterator(ptr, ptr + 1)
-        return self._iterator(0, 0)
+        out = '(%s) %s'  % (str(self._ptype()), str(self._pointer()))
+        return '%s "%s"' % (out, s) if s is not None else out
 
 
 class SmartPtrPrinter(PtrPrinter):
-    RECOGNIZE = '^HPHP::(SmartPtr<.*>|(Static)?String|Array|Object)$'
+    RECOGNIZE = '^HPHP::(SmartPtr<.*>)$'
 
     def __init__(self, val):
         self.val = val
 
+    def _ptype(self):
+        return self.val.type
+
     def _pointer(self):
         return self.val['m_px']
+
+class StringPrinter(SmartPtrPrinter):
+    RECOGNIZE = '^HPHP::(Static)?String$'
+
+    def __init__(self, val):
+        super(StringPrinter, self).__init__(val['m_str'])
+
+class ArrayPrinter(SmartPtrPrinter):
+    RECOGNIZE = '^HPHP::Array$'
+
+    def __init__(self, val):
+        super(ArrayPrinter, self).__init__(val['m_arr'])
+
+class ObjectPrinter(SmartPtrPrinter):
+    RECOGNIZE = '^HPHP::Object$'
+
+    def __init__(self, val):
+        super(ObjectPrinter, self).__init__(val['m_obj'])
+
+class ResourcePrinter(SmartPtrPrinter):
+    RECOGNIZE = '^HPHP::Resource$'
+
+    def __init__(self, val):
+        super(ResourcePrinter, self).__init__(val['m_res'])
+
 
 class LowPtrPrinter(PtrPrinter):
     RECOGNIZE = '^HPHP::(LowPtr<.*>|LowPtrImpl<.*>)$'
 
     def __init__(self, val):
         self.val = val
+
+    def _ptype(self):
+        return self.val.type
 
     def _pointer(self):
         inner = self.val.type.template_argument(0)
@@ -171,7 +179,7 @@ class LowPtrPrinter(PtrPrinter):
 #------------------------------------------------------------------------------
 # ArrayData.
 
-class ArrayDataPrinter:
+class ArrayDataPrinter(object):
     RECOGNIZE = '^HPHP::(ArrayData|MixedArray|ProxyArray)$'
 
     class _packed_iterator(_BaseIterator):
@@ -186,7 +194,11 @@ class ArrayDataPrinter:
 
             elt = self.cur
             key = '%d' % self.count
-            data = elt.dereference()
+
+            try:
+                data = elt.dereference()
+            except gdb.MemoryError:
+                data = '<invalid>'
 
             self.cur = self.cur + 1
             self.count = self.count + 1
@@ -203,19 +215,26 @@ class ArrayDataPrinter:
 
             elt = self.cur
 
-            if elt['data']['m_aux']['u_hash'] == 0:
-                key = '%d' % elt['ikey']
-            else:
-                key = '"%s"' % string_data_val(elt['skey'].dereference())
+            try:
+                if elt['data']['m_aux']['u_hash'] == 0:
+                    key = '%d' % elt['ikey']
+                else:
+                    key = '"%s"' % string_data_val(elt['skey'].dereference())
+            except gdb.MemoryError:
+                key = '<invalid>'
 
-            data = elt['data'].cast(T('HPHP::TypedValue'))
+            try:
+                data = elt['data'].cast(T('HPHP::TypedValue'))
+            except gdb.MemoryError:
+                data = '<invalid>'
 
             self.cur = self.cur + 1
             return (key, data)
 
 
     def __init__(self, val):
-        self.kind = val['m_kind']
+        kind_ty = T('HPHP::ArrayData::ArrayKind')
+        self.kind = val['m_hdr']['kind'].cast(kind_ty)
 
         if self.kind == self._kind('Mixed'):
             self.val = val.cast(T('HPHP::MixedArray'))
@@ -261,7 +280,7 @@ class ArrayDataPrinter:
 #------------------------------------------------------------------------------
 # ObjectData.
 
-class ObjectDataPrinter:
+class ObjectDataPrinter(object):
     RECOGNIZE = '^HPHP::(ObjectData)$'
 
     class _iterator(_BaseIterator):
@@ -277,8 +296,14 @@ class ObjectDataPrinter:
 
             decl_props = self.cls['m_declProperties']
 
-            name = idx.indexed_string_map_at(decl_props, self.cur)['m_name']
-            val = idx.object_data_at(self.obj, name)
+            try:
+                name = idx.indexed_string_map_at(decl_props, self.cur)['m_name']
+                try:
+                    val = idx.object_data_at(self.obj, name)
+                except gdb.MemoryError:
+                    val = None
+            except gdb.MemoryError:
+                name = '<invalid>'
 
             self.cur = self.cur + 1
 
@@ -292,7 +317,7 @@ class ObjectDataPrinter:
         self.cls = deref(val['m_cls'])
 
     def to_string(self):
-        return "Object of class %s @ %s" % (
+        return 'Object of class "%s" @ %s' % (
             nameof(self.cls),
             self.val.address)
 
@@ -303,7 +328,7 @@ class ObjectDataPrinter:
 #------------------------------------------------------------------------------
 # RefData.
 
-class RefDataPrinter:
+class RefDataPrinter(object):
     RECOGNIZE = '^HPHP::RefData$'
 
     def __init__(self, val):
@@ -319,6 +344,10 @@ class RefDataPrinter:
 printer_classes = [
     TypedValuePrinter,
     SmartPtrPrinter,
+    ArrayPrinter,
+    ObjectPrinter,
+    StringPrinter,
+    ResourcePrinter,
     LowPtrPrinter,
     StringDataPrinter,
     ArrayDataPrinter,

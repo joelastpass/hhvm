@@ -12,9 +12,9 @@ open ClientCommand
 open ClientEnv
 open Utils
 
-let rec guess_root config start recursion_limit : Path.path option =
-  let fs_root = Path.mk_path "/" in
-  if Path.equal start fs_root then None
+let rec guess_root config start recursion_limit : Path.t option =
+  let fs_root = Path.make "/" in
+  if start = fs_root then None
   else if Wwwroot.is_www_directory ~config start then Some start
   else if recursion_limit <= 0 then None
   else guess_root config (Path.parent start) (recursion_limit - 1)
@@ -42,7 +42,7 @@ let get_root ?(config=".hhconfig") path_opt =
   let start_str = match path_opt with
     | None -> "."
     | Some s -> s in
-  let start_path = Path.mk_path start_str in
+  let start_path = Path.make start_str in
   let root = match guess_root config start_path 50 with
     | None -> start_path
     | Some r -> r in
@@ -64,6 +64,7 @@ let parse_check_args cmd =
   let timeout = ref None in
   let autostart = ref true in
   let from = ref "" in
+  let version = ref false in
 
   (* custom behaviors *)
   let set_from x () = from := x in
@@ -112,6 +113,8 @@ let parse_check_args cmd =
       "";
     "--list-files", Arg.Unit (set_mode MODE_LIST_FILES),
       " (mode) list files with errors";
+    "--list-modes", Arg.Unit (set_mode MODE_LIST_MODES),
+      " (mode) list all files with their associated hack modes";
     "--auto-complete", Arg.Unit (set_mode MODE_AUTO_COMPLETE),
       " (mode) auto-completes the text on stdin";
     "--color", Arg.String (fun x -> set_mode (MODE_COLORING x) ()),
@@ -122,6 +125,19 @@ let parse_check_args cmd =
       " (mode) finds references of the provided method name";
     "--find-class-refs", Arg.String (fun x -> set_mode (MODE_FIND_CLASS_REFS x) ()),
       " (mode) finds references of the provided class name";
+    "--dump-symbol-info", Arg.String (fun files ->
+        set_mode (MODE_DUMP_SYMBOL_INFO files) ()
+        ),
+      (*  Input format:
+       *  The file list can either be "-" which accepts the input from stdin
+       *  separated by newline(for long list) or directly from command line
+       *  separated by semicolon.
+       *  Output format:
+       *    [
+       *      "function_calls": list of fun_calls;
+       *    ]
+       *  Note: results list can be in any order *)
+      "";
     "--identify-function", Arg.String (fun x -> set_mode (MODE_IDENTIFY_FUNCTION x) ()),
       " (mode) print the full function name at the position [line:character] of the text on stdin";
     "--refactor", Arg.Unit (set_mode MODE_REFACTOR),
@@ -152,7 +168,16 @@ let parse_check_args cmd =
       " (mode) prints a list of all related classes or methods to the given class";
     "--show", Arg.String (fun x -> set_mode (MODE_SHOW x) ()),
       " (mode) show human-readable type info for the given name; output is not meant for machine parsing";
-     "--version", Arg.Unit (set_mode MODE_VERSION),
+    "--lint", Arg.Rest begin fun fn ->
+        mode := match !mode with
+          | MODE_UNSPECIFIED -> MODE_LINT [fn]
+          | MODE_LINT fnl -> MODE_LINT (fn :: fnl)
+          | _ -> raise (Arg.Bad "only a single mode should be specified")
+      end,
+      " (mode) lint the given list of files";
+    "--lint-all", Arg.Int (fun x -> set_mode (MODE_LINT_ALL x) ()),
+      " (mode) find all occurrences of lint with the given error code";
+    "--version", Arg.Set version,
       " (mode) show version and exit\n";
 
     (* flags *)
@@ -184,6 +209,11 @@ let parse_check_args cmd =
       " (deprecated) equivalent to --from check_trunk";
   ] in
   let args = parse_without_command options usage "check" in
+
+  if !version then begin
+    print_endline Build_id.build_id_ohai;
+    exit 0;
+  end;
 
   (* fixups *)
   if !mode == MODE_UNSPECIFIED then mode := MODE_STATUS;
@@ -324,7 +354,8 @@ let parse_build_args () =
   in
   CBuild { ClientBuild.
     root = root;
-    build_opts = { ServerMsg.
+    wait = !wait;
+    build_opts = { ServerBuild.
       steps = !steps;
       no_steps = !no_steps;
       run_scripts = !run_scripts;
@@ -336,8 +367,8 @@ let parse_build_args () =
       clean_before_build = !clean_before_build;
       check = !check;
       incremental = !incremental;
+      user = Sys_utils.logname ();
       verbose = !verbose;
-      wait = !wait;
     }
   }
 

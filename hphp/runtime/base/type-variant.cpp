@@ -19,6 +19,7 @@
 #include "hphp/parser/hphp.tab.hpp"
 
 #include "hphp/runtime/base/array-iterator.h"
+#include "hphp/runtime/base/collections.h"
 #include "hphp/runtime/base/comparisons.h"
 #include "hphp/runtime/base/dummy-resource.h"
 #include "hphp/runtime/base/externals.h"
@@ -80,7 +81,7 @@ const StaticString
 
 ///////////////////////////////////////////////////////////////////////////////
 
-Variant::Variant(litstr v) {
+Variant::Variant(const char* v) {
   m_type = KindOfString;
   m_data.pstr = StringData::Make(v);
   m_data.pstr->incRefCount();
@@ -716,29 +717,30 @@ void Variant::setEvalScalar() {
 ///////////////////////////////////////////////////////////////////////////////
 // output functions
 
-void Variant::serialize(VariableSerializer *serializer,
-                        bool isArrayKey /* = false */,
-                        bool skipNestCheck /* = false */,
-                        bool noQuotes /* = false */) const {
-  if (m_type == KindOfRef) {
+void serializeVariant(const Variant& self, VariableSerializer *serializer,
+                      bool isArrayKey /* = false */,
+                      bool skipNestCheck /* = false */,
+                      bool noQuotes /* = false */) {
+  auto tv = self.asTypedValue();
+  if (tv->m_type == KindOfRef) {
     // Ugly, but behavior is different for serialize
     if (serializer->getType() == VariableSerializer::Type::Serialize ||
         serializer->getType() == VariableSerializer::Type::APCSerialize ||
         serializer->getType() == VariableSerializer::Type::DebuggerSerialize) {
-      if (serializer->incNestedLevel(m_data.pref->var())) {
-        serializer->writeOverflow(m_data.pref->var());
+      if (serializer->incNestedLevel(tv->m_data.pref->var())) {
+        serializer->writeOverflow(tv->m_data.pref->var());
       } else {
         // Tell the inner variant to skip the nesting check for data inside
-        m_data.pref->var()->serialize(serializer, isArrayKey, true);
+        serializeVariant(*tv->m_data.pref->var(), serializer, isArrayKey, true);
       }
-      serializer->decNestedLevel(m_data.pref->var());
+      serializer->decNestedLevel(tv->m_data.pref->var());
     } else {
-      m_data.pref->var()->serialize(serializer, isArrayKey);
+      serializeVariant(*tv->m_data.pref->var(), serializer, isArrayKey);
     }
     return;
   }
 
-  switch (m_type) {
+  switch (tv->m_type) {
     case KindOfUninit:
     case KindOfNull:
       assert(!isArrayKey);
@@ -747,36 +749,36 @@ void Variant::serialize(VariableSerializer *serializer,
 
     case KindOfBoolean:
       assert(!isArrayKey);
-      serializer->write(m_data.num != 0);
+      serializer->write(tv->m_data.num != 0);
       return;
 
     case KindOfInt64:
-      serializer->write(m_data.num);
+      serializer->write(tv->m_data.num);
       return;
 
     case KindOfDouble:
-      serializer->write(m_data.dbl);
+      serializer->write(tv->m_data.dbl);
       return;
 
     case KindOfStaticString:
     case KindOfString:
-      serializer->write(m_data.pstr->data(),
-                        m_data.pstr->size(), isArrayKey, noQuotes);
+      serializer->write(tv->m_data.pstr->data(),
+                        tv->m_data.pstr->size(), isArrayKey, noQuotes);
       return;
 
     case KindOfArray:
       assert(!isArrayKey);
-      m_data.parr->serialize(serializer, skipNestCheck);
+      tv->m_data.parr->serialize(serializer, skipNestCheck);
       return;
 
     case KindOfObject:
       assert(!isArrayKey);
-      m_data.pobj->serialize(serializer);
+      tv->m_data.pobj->serialize(serializer);
       return;
 
     case KindOfResource:
       assert(!isArrayKey);
-      m_data.pres->serialize(serializer);
+      tv->m_data.pres->serialize(serializer);
       return;
 
     case KindOfRef:
@@ -808,8 +810,11 @@ static void unserializeProp(VariableUnserializer* uns,
     t = &tvAsVariant(lookup.prop);
   }
 
-  t->unserialize(uns);
+  if (UNLIKELY(IS_REFCOUNTED_TYPE(t->getRawType()))) {
+    uns->putInOverwrittenList(*t);
+  }
 
+  unserializeVariant(*t, uns);
   if (!RuntimeOption::RepoAuthoritative) return;
   if (!Repo::get().global().HardPrivatePropInference) return;
 
@@ -883,24 +888,23 @@ static Class* tryAlternateCollectionClass(const StringData* clsName) {
   return altName ? Unit::getClass(altName, /* autoload */ false) : nullptr;
 }
 
-void Variant::unserialize(VariableUnserializer *uns,
-                          Uns::Mode mode /* = Uns::Mode::Value */) {
+void unserializeVariant(Variant& self, VariableUnserializer *uns,
+                        UnserializeMode mode /* = UnserializeMode::Value */) {
 
   // NOTE: If you make changes to how serialization and unserialization work,
   // make sure to update the reserialize() method in "runtime/ext/ext_apc.cpp"
   // and to update test_apc_reserialize() in "test/ext/test_ext_apc.cpp".
 
-  char type, sep;
-  type = uns->readChar();
-  sep = uns->readChar();
+  char type = uns->readChar();
+  char sep = uns->readChar();
 
   if (type != 'R') {
-    uns->add(this, mode);
+    uns->add(&self, mode);
   }
 
   if (type == 'N') {
     if (sep != ';') throw Exception("Expected ';' but got '%c'", sep);
-    setNull(); // NULL *IS* the value, without we get undefined warnings
+    self.setNull(); // NULL *IS* the value, without we get undefined warnings
     return;
   }
   if (sep != ':') {
@@ -915,7 +919,7 @@ void Variant::unserialize(VariableUnserializer *uns,
       if (v == nullptr) {
         throw Exception("Id %" PRId64 " out of range", id);
       }
-      operator=(*v);
+      self = *v;
     }
     break;
   case 'R':
@@ -925,11 +929,11 @@ void Variant::unserialize(VariableUnserializer *uns,
       if (v == nullptr) {
         throw Exception("Id %" PRId64 " out of range", id);
       }
-      assignRef(*v);
+      self.assignRef(*v);
     }
     break;
-  case 'b': { int64_t v = uns->readInt(); operator=((bool)v); } break;
-  case 'i': { int64_t v = uns->readInt(); operator=(v);       } break;
+  case 'b': { int64_t v = uns->readInt(); self = (bool)v; } break;
+  case 'i': { int64_t v = uns->readInt(); self = v;       } break;
   case 'd':
     {
       double v;
@@ -956,14 +960,14 @@ void Variant::unserialize(VariableUnserializer *uns,
       } else {
         v = uns->readDouble();
       }
-      operator=(negative ? -v : v);
+      self = negative ? -v : v;
     }
     break;
   case 's':
     {
       String v;
       v.unserialize(uns);
-      operator=(v);
+      self = std::move(v);
       if (!uns->endOfBuffer()) {
         // Semicolon *should* always be required,
         // but PHP's implementation allows omitting it
@@ -972,9 +976,8 @@ void Variant::unserialize(VariableUnserializer *uns,
         // So we'll do the same.  Sigh.
         uns->readChar();
       }
-      return;
     }
-    break;
+    return;
   case 'S':
     if (uns->type() == VariableUnserializer::Type::APCSerialize) {
       union {
@@ -982,22 +985,20 @@ void Variant::unserialize(VariableUnserializer *uns,
         StringData *sd;
       } u;
       uns->read(u.buf, 8);
-      operator=(u.sd);
+      self = u.sd;
     } else {
       throw Exception("Unknown type '%c'", type);
     }
     break;
   case 'a':
     {
-      // check stack depth to avoid overflow
-      check_native_recursion();
-
-      Array v = Array::Create();
+      // Check stack depth to avoid overflow.
+      check_recursion_throw();
+      auto v = Array::Create();
       v.unserialize(uns);
-      operator=(v);
-      return; // array has '}' terminating
+      self = std::move(v);
     }
-    break;
+    return; // array has '}' terminating
   case 'L':
     {
       int64_t id = uns->readInt();
@@ -1009,10 +1010,9 @@ void Variant::unserialize(VariableUnserializer *uns,
       auto rsrc = makeSmartPtr<DummyResource>();
       rsrc->o_setResourceId(id);
       rsrc->m_class_name = rsrcName;
-      operator=(rsrc);
-      return; // resource has '}' terminating
+      self = std::move(rsrc);
     }
-    break;
+    return; // resource has '}' terminating
   case 'O':
   case 'V':
   case 'K':
@@ -1077,7 +1077,8 @@ void Variant::unserialize(VariableUnserializer *uns,
           throw_null_pointer_exception();
         } else {
           obj = ObjectData::newInstance(cls);
-          if (UNLIKELY(cls == c_Pair::classof() && size != 2)) {
+          if (UNLIKELY(collections::isType(cls, CollectionType::Pair) &&
+                       (size != 2))) {
             throw Exception("Pair objects must have exactly 2 elements");
           }
         }
@@ -1087,11 +1088,11 @@ void Variant::unserialize(VariableUnserializer *uns,
         obj->o_set(s_PHP_Incomplete_Class_Name, clsName);
       }
       assert(!obj.isNull());
-      operator=(obj);
+      self = obj;
 
       if (size > 0) {
-        // check stack depth to avoid overflow
-        check_native_recursion();
+        // Check stack depth to avoid overflow.
+        check_recursion_throw();
 
         if (type == 'O') {
           // Collections are not allowed
@@ -1111,13 +1112,13 @@ void Variant::unserialize(VariableUnserializer *uns,
           */
           for (int64_t i = size; i--; ) {
             Variant v;
-            v.unserialize(uns, Uns::Mode::Key);
+            unserializeVariant(v, uns, UnserializeMode::Key);
             String key = v.toString();
             int ksize = key.size();
             const char *kdata = key.data();
             int subLen = 0;
             if (key == ObjectData::s_serializedNativeDataKey) {
-              serializedNativeData.unserialize(uns);
+              unserializeVariant(serializedNativeData, uns);
               hasSerializedNativeData = true;
             } else if (kdata[0] == '\0') {
               if (UNLIKELY(!ksize)) {
@@ -1167,7 +1168,7 @@ void Variant::unserialize(VariableUnserializer *uns,
           if (!obj->isCollection()) {
             throw Exception("%s is not a collection class", clsName.data());
           }
-          collectionUnserialize(obj.get(), uns, size, type);
+          collections::unserialize(obj.get(), uns, size, type);
         }
       }
       uns->expectChar('}');
@@ -1180,10 +1181,8 @@ void Variant::unserialize(VariableUnserializer *uns,
       }
 
       check_request_surprise_unlikely();
-
-      return; // object has '}' terminating
     }
-    break;
+    return; // object has '}' terminating
   case 'C':
     {
       if (uns->type() == VariableUnserializer::Type::DebuggerSerialize) {
@@ -1218,10 +1217,9 @@ void Variant::unserialize(VariableUnserializer *uns,
         obj.get()->clearNoDestruct();
       }
 
-      operator=(obj);
-      return; // object has '}' terminating
+      self = std::move(obj);
     }
-    break;
+    return; // object has '}' terminating
   default:
     throw Exception("Unknown type '%c'", type);
   }

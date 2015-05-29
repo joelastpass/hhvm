@@ -95,10 +95,10 @@ uint16_t LibEventTransport::getRemotePort() {
   return m_remote_port;
 }
 
-const char *LibEventTransport::getServerAddr() {
+const std::string& LibEventTransport::getServerAddr() {
   return m_remote_ip.isV6() ?
-    RuntimeOption::ServerPrimaryIPv6.c_str() :
-    RuntimeOption::ServerPrimaryIPv4.c_str();
+    RuntimeOption::GetServerPrimaryIPv6() :
+    RuntimeOption::GetServerPrimaryIPv4();
 }
 
 const void *LibEventTransport::getPostData(int &size) {
@@ -257,7 +257,7 @@ bool LibEventTransport::isServerStopping() {
 }
 
 void LibEventTransport::sendImpl(const void *data, int size, int code,
-                                 bool chunked) {
+                                 bool chunked, bool eom) {
   assert(data);
   assert(!m_sendStarted || chunked);
   if (m_sendEnded) {
@@ -293,11 +293,16 @@ void LibEventTransport::sendImpl(const void *data, int size, int code,
     m_sendEnded = true;
   }
   m_sendStarted = true;
+  if (eom) {
+    onSendEndImpl();
+  }
 }
 
 void LibEventTransport::onSendEndImpl() {
   if (m_chunkedEncoding) {
-    m_server->onChunkedResponseEnd(m_workerId, m_request);
+    if (!m_sendEnded) {
+      m_server->onChunkedResponseEnd(m_workerId, m_request);
+    }
     m_sendEnded = true;
   } else {
     assert(m_sendEnded); // otherwise, we didn't call send for this request

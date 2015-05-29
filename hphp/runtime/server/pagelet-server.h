@@ -26,6 +26,7 @@
 #include "hphp/runtime/base/type-array.h"
 #include "hphp/runtime/server/transport.h"
 #include "hphp/runtime/server/server-task-event.h"
+#include "hphp/util/synchronizable.h"
 
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
@@ -100,7 +101,7 @@ public:
   virtual void addHeaderImpl(const char *name, const char *value);
   virtual void removeHeaderImpl(const char *name);
   virtual void sendImpl(const void *data, int size, int code,
-                        bool chunked);
+                        bool chunked, bool eom);
   virtual void onSendEndImpl();
   virtual bool isUploadedFile(const String& filename);
   virtual bool getFiles(std::string &files);
@@ -133,6 +134,8 @@ public:
   void setAsioEvent(PageletServerTaskEvent *event);
 
 private:
+  template <typename F> friend void scan(const PageletTransport&, F&);
+
   std::atomic<int> m_refCount;
   int m_timeoutSeconds;
 

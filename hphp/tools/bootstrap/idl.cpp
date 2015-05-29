@@ -31,7 +31,8 @@ namespace HPHP {
  * to link this against, so provide our own simple implementation of
  * assert_fail. */
 void assert_fail(const char* e, const char* file,
-                 unsigned int line, const char* func) {
+                 unsigned int line, const char* func,
+                 const std::string&) {
   fprintf(stderr, "%s:%u: %s: assertion `%s' failed.", file, line, func, e);
   std::abort();
 }
@@ -142,7 +143,6 @@ static const std::unordered_map<fbstring, FuncFlags> g_flagsMap =
   {"HasOptFunction",                 HasOptFunction},
   {"AllowIntercept",                 AllowIntercept},
   {"NoProfile",                      NoProfile},
-  {"ContextSensitive",               ContextSensitive},
   {"NoDefaultSweep",                 NoDefaultSweep},
   {"IsSystem",                       IsSystem},
   {"IsTrait",                        IsTrait},

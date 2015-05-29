@@ -20,6 +20,7 @@
 #include "hphp/runtime/base/array-init.h"
 #include "hphp/runtime/base/builtin-functions.h"
 #include "hphp/runtime/base/comparisons.h"
+#include "hphp/runtime/base/memory-manager.h"
 #include "hphp/runtime/base/program-functions.h"
 #include "hphp/runtime/base/runtime-option.h"
 #include "hphp/runtime/server/server-stats.h"
@@ -41,6 +42,12 @@ using std::set;
 
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
+
+IMPLEMENT_THREAD_LOCAL(AccessLog::ThreadData,
+                       RPCRequestHandler::s_accessLogThreadData);
+
+AccessLog RPCRequestHandler::s_accessLog(
+  &(RPCRequestHandler::getAccessLogThreadData));
 
 RPCRequestHandler::RPCRequestHandler(int timeout, bool info)
   : RequestHandler(timeout),
@@ -99,7 +106,7 @@ void RPCRequestHandler::handleRequest(Transport *transport) {
   ExecutionProfiler ep(ThreadInfo::RuntimeFunctions);
 
   Logger::OnNewRequest();
-  HttpRequestHandler::GetAccessLog().onNewRequest();
+  GetAccessLog().onNewRequest();
   m_context->setTransport(transport);
   transport->enableCompression();
 
@@ -110,6 +117,23 @@ void RPCRequestHandler::handleRequest(Transport *transport) {
   StackTraceNoHeap::ExtraLoggingClearer clearer;
   StackTraceNoHeap::AddExtraLogging("RPC-URL", transport->getUrl());
 
+  // Checking functions whitelist
+  const std::set<std::string> &functions = m_serverInfo->getFunctions();
+  if (!functions.empty()) {
+    auto iter = functions.find(transport->getCommand());
+    if (iter == functions.end()) {
+      transport->sendString("Forbidden", 403);
+      transport->onSendEnd();
+      GetAccessLog().log(transport, nullptr);
+      /*
+       * HPHP logs may need to access data in ServerStats, so we have to
+       * clear the hashtable after writing the log entry.
+       */
+      ServerStats::Reset();
+      return;
+    }
+  }
+
   // authentication
   const std::set<std::string> &passwords = m_serverInfo->getPasswords();
   if (!passwords.empty()) {
@@ -117,7 +141,7 @@ void RPCRequestHandler::handleRequest(Transport *transport) {
     if (iter == passwords.end()) {
       transport->sendString("Unauthorized", 401);
       transport->onSendEnd();
-      HttpRequestHandler::GetAccessLog().log(transport, nullptr);
+      GetAccessLog().log(transport, nullptr);
       /*
        * HPHP logs may need to access data in ServerStats, so we have to
        * clear the hashtable after writing the log entry.
@@ -130,7 +154,7 @@ void RPCRequestHandler::handleRequest(Transport *transport) {
     if (!password.empty() && password != transport->getParam("auth")) {
       transport->sendString("Unauthorized", 401);
       transport->onSendEnd();
-      HttpRequestHandler::GetAccessLog().log(transport, nullptr);
+      GetAccessLog().log(transport, nullptr);
       /*
        * HPHP logs may need to access data in ServerStats, so we have to
        * clear the hashtable after writing the log entry.
@@ -152,7 +176,7 @@ void RPCRequestHandler::handleRequest(Transport *transport) {
   if (vhost->disabled()) {
     transport->sendString("Virtual host disabled.", 404);
     transport->onSendEnd();
-    HttpRequestHandler::GetAccessLog().log(transport, vhost);
+    GetAccessLog().log(transport, vhost);
     return;
   }
 
@@ -182,7 +206,7 @@ void RPCRequestHandler::handleRequest(Transport *transport) {
   // record request for debugging purpose
   std::string tmpfile = HttpProtocol::RecordRequest(transport);
   bool ret = executePHPFunction(transport, sourceRootInfo, returnEncodeType);
-  HttpRequestHandler::GetAccessLog().log(transport, vhost);
+  GetAccessLog().log(transport, vhost);
   /*
    * HPHP logs may need to access data in ServerStats, so we have to
    * clear the hashtable after writing the log entry.
@@ -192,11 +216,11 @@ void RPCRequestHandler::handleRequest(Transport *transport) {
 }
 
 void RPCRequestHandler::abortRequest(Transport *transport) {
-  HttpRequestHandler::GetAccessLog().onNewRequest();
+  GetAccessLog().onNewRequest();
   const VirtualHost *vhost = HttpProtocol::GetVirtualHost(transport);
   assert(vhost);
   transport->sendString("Service Unavailable", 503);
-  HttpRequestHandler::GetAccessLog().log(transport, vhost);
+  GetAccessLog().log(transport, vhost);
 }
 
 const StaticString

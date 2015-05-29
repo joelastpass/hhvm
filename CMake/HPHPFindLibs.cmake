@@ -28,7 +28,7 @@ if (LIBDL_INCLUDE_DIRS)
 endif()
 
 # boost checks
-find_package(Boost 1.49.0 COMPONENTS system program_options filesystem REQUIRED)
+find_package(Boost 1.51.0 COMPONENTS system program_options filesystem context REQUIRED)
 include_directories(${Boost_INCLUDE_DIRS})
 link_directories(${Boost_LIBRARY_DIRS})
 add_definitions("-DHAVE_BOOST1_49")
@@ -58,14 +58,33 @@ if (LIBICONV_CONST)
   add_definitions("-DICONV_CONST=const")
 endif()
 
-# mysql checks
-find_package(MySQL REQUIRED)
-include_directories(${MYSQL_INCLUDE_DIR})
-link_directories(${MYSQL_LIB_DIR})
+# mysql checks - if we're using async mysql, we use webscalesqlclient from
+# third-party/ instead
+if (ENABLE_ASYNC_MYSQL)
+  include_directories(
+    ${TP_DIR}/re2/src/
+    ${TP_DIR}/squangle/src/
+    ${TP_DIR}/webscalesqlclient/src/include/
+  )
+  set(MYSQL_CLIENT_LIB_DIR ${TP_DIR}/webscalesqlclient/src/)
+  # Unlike the .so, the static library intentionally does not link against
+  # yassl, despite building it :/
+  set(MYSQL_CLIENT_LIBS
+    ${MYSQL_CLIENT_LIB_DIR}/libmysql/libwebscalesqlclient_r.a
+    ${MYSQL_CLIENT_LIB_DIR}/extra/yassl/libyassl.a
+    ${MYSQL_CLIENT_LIB_DIR}/extra/yassl/taocrypt/libtaocrypt.a
+  )
+else()
+  find_package(MySQL REQUIRED)
+  link_directories(${MYSQL_LIB_DIR})
+  include_directories(${MYSQL_INCLUDE_DIR})
+endif()
 MYSQL_SOCKET_SEARCH()
 if (MYSQL_UNIX_SOCK_ADDR)
   add_definitions(-DPHP_MYSQL_UNIX_SOCK_ADDR="${MYSQL_UNIX_SOCK_ADDR}")
-endif()
+else ()
+  message(FATAL_ERROR "Could not find MySQL socket path - if you install a MySQL server, this should be automatically detected. Alternatively, specify -DMYSQL_UNIX_SOCK_ADDR=/path/to/mysql.socket ; if you don't care about unix socket support for MySQL, specify -DMYSQL_UNIX_SOCK_ADDR=/dev/null")
+endif ()
 
 # libmemcached checks
 find_package(Libmemcached REQUIRED)
@@ -436,6 +455,9 @@ macro(hphp_link target)
 
   target_link_libraries(${target} ${Boost_LIBRARIES})
   target_link_libraries(${target} ${MYSQL_CLIENT_LIBS})
+  if (ENABLE_ASYNC_MYSQL)
+    target_link_libraries(${target} squangle)
+  endif()
   target_link_libraries(${target} ${PCRE_LIBRARY})
   target_link_libraries(${target} ${ICU_DATA_LIBRARIES} ${ICU_I18N_LIBRARIES} ${ICU_LIBRARIES})
   target_link_libraries(${target} ${LIBEVENT_LIB})
@@ -547,6 +569,10 @@ macro(hphp_link target)
 
   target_link_libraries(${target} timelib)
   target_link_libraries(${target} folly)
+
+  if (ENABLE_MCROUTER)
+    target_link_libraries(${target} mcrouter)
+  endif()
 
   target_link_libraries(${target} afdt)
   target_link_libraries(${target} mbfl)

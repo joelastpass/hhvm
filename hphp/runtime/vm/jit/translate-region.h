@@ -18,10 +18,11 @@
 
 #include "hphp/runtime/vm/jit/types.h"  // TransFlags
 #include "hphp/runtime/vm/jit/prof-data.h"
+#include "hphp/runtime/vm/jit/prof-src-key.h"
 
 namespace HPHP { namespace jit {
 
-struct HTS;
+struct IRGS;
 
 //////////////////////////////////////////////////////////////////////
 
@@ -47,10 +48,11 @@ using RegionBlacklist = ProfSrcKeySet;
  * and the instruction is added to `interp' so that it will be interpreted on
  * the next attempt.
  */
-TranslateResult translateRegion(HTS&,
+TranslateResult translateRegion(IRGS&,
                                 const RegionDesc&,
                                 RegionBlacklist& toInterp,
-                                TransFlags trflags);
+                                TransFlags trflags,
+                                PostConditions& pconds);
 
 //////////////////////////////////////////////////////////////////////
 

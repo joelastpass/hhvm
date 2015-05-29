@@ -36,7 +36,7 @@ struct IRUnit;
  *
  * Right now we have a static maximum number of tracked locations---passes
  * using information from this module must be conservative about locations that
- * aren't assigned an id.  (E.g. via may_alias in AliasAnalysis.)
+ * aren't assigned an id.  (E.g. via calls to may_alias in AliasAnalysis.)
  */
 constexpr uint32_t kMaxTrackedALocs = 128;
 using ALocBits = std::bitset<kMaxTrackedALocs>;
@@ -85,47 +85,51 @@ struct AliasAnalysis {
 
   /*
    * Several larger sets of locations, we have a set of all the ids assigned to
-   * properties, elemIs, and frame locals.  This is used by may_alias below.
+   * properties, elemIs, frame locals, etc.  This is used by may_alias below.
    */
   ALocBits all_props;
   ALocBits all_elemIs;
   ALocBits all_frame;
   ALocBits all_stack;
+  ALocBits all_mistate;
+  ALocBits all_refs;
 
   /*
-   * Sets of alias classes that are used by must_alias.
-   *
-   * Note: right now this is only populated for stack locations.  You will have
-   * to add more to collect_aliases if you have a new use case.
+   * Return the number of distinct locations we're tracking by id
    */
-  jit::hash_map<AliasClass,ALocBits,AliasClass::Hash> must_alias_map;
+  size_t count() const { return locations_inv.size(); }
 
   /*
-   * Return a set of locations that we've assigned ids to that may be affected
-   * by a memory operation.  This function is used to get information about
-   * possible effects from an operation on a location that we aren't tracking.
-   * This is often needed for instructions that affect very large alias classes
-   * like ANonFrame.
+   * Return a set of locations that we've assigned ids to that may alias a
+   * given AliasClass.  Note that (as usual) memory locations we haven't
+   * assigned bits to may still be affected, but this module only reports
+   * effects on locations assigned bits.
    *
-   * Also, note that because of the kMaxTrackedALocs limit, this location could
-   * be very 'concrete' (a prop on a known object for example).  But even in
-   * those cases, since it's not tracked, we have to use things like all_props
-   * to determine what it may alias.
-   *
-   * The precondition is just because you should generally be using the
-   * conflict set in ALocMeta if we have one for `acls'---it'll be much less
-   * conservative.
-   *
-   * Pre: find(acls) == folly::none
+   * This function may conservatively return more bits than actually may
+   * overlap `acls'.
    */
   ALocBits may_alias(AliasClass acls) const;
 
   /*
-   * Return a set of locations that we've assigned ids to that must be
-   * contained in `acls'.  This function will conservatively return an empty
-   * set.
+   * Return a set of locations that we've assigned ids to that are definitely
+   * contained in `acls'.  This function may conservatively return a smaller
+   * set of bits: every bit that is set in the returned ALocBits is contained
+   * in `acls', but there may be locations contained in `acls' that don't have
+   * a bit set in the returned vector.
+   *
+   * This should generally be used with AliasClasses that are exhaustive,
+   * must-style information.  That is, AliasClasses that should be interpreted
+   * as referring to every point they contain.  Right now, the primary example
+   * of that sort of AliasClasses is the class of locations in `kills' sets in
+   * certain memory effects structs: these sets indicate every location inside
+   * the class is affected.
+   *
+   * Right now, this function will work for specific AliasClasses we've
+   * assigned ids---for larger classes, it only supports stack ranges observed
+   * during alias collection, AFrameAny, and some cases of unions of those---if
+   * you need more to work, the implementation will need some improvements.
    */
-  ALocBits must_alias(AliasClass acls) const;
+  ALocBits expand(AliasClass acls) const;
 
   /*
    * Map from frame SSATmp ids to the location bits for all of the frame's

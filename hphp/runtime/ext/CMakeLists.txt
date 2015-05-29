@@ -31,12 +31,11 @@ foreach (dir ${subdirs})
   endif()
 endforeach()
 
-if(NOT LINUX)
-       add_definitions(-DNO_HARDWARE_COUNTERS)
-endif()
-
 ADD_LIBRARY(hphp_runtime_ext STATIC
             ${CXX_SOURCES} ${C_SOURCES} ${ASM_SOURCES})
+if (ENABLE_ASYNC_MYSQL)
+  add_dependencies(hphp_runtime_ext webscalesqlclient squangle)
+endif ()
 target_link_libraries(hphp_runtime_ext ${HRE_LIBRARIES})
 hphp_link(hphp_runtime_ext)
 

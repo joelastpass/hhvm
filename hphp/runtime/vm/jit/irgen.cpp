@@ -17,6 +17,8 @@
 
 #include "hphp/runtime/vm/jit/irgen-exit.h"
 #include "hphp/runtime/vm/jit/irgen-control.h"
+#include "hphp/runtime/vm/jit/cfg.h"
+#include "hphp/runtime/vm/jit/dce.h"
 
 #include "hphp/runtime/vm/jit/irgen-internal.h"
 
@@ -26,7 +28,7 @@ namespace {
 
 //////////////////////////////////////////////////////////////////////
 
-Block* create_catch_block(HTS& env) {
+Block* create_catch_block(IRGS& env) {
   auto const catchBlock = env.irb->unit().defBlock(Block::Hint::Unused);
   BlockPusher bp(*env.irb, env.irb->curMarker(), catchBlock);
 
@@ -39,11 +41,12 @@ Block* create_catch_block(HTS& env) {
 
   gen(env, BeginCatch);
   spillStack(env);
-  gen(env, EndCatch, StackOffset { offsetFromSP(env, 0) }, fp(env), sp(env));
+  gen(env, EndCatch, IRSPOffsetData { offsetFromIRSP(env, BCSPOffset{0}) },
+    fp(env), sp(env));
   return catchBlock;
 }
 
-void check_catch_stack_state(HTS& env, const IRInstruction* inst) {
+void check_catch_stack_state(IRGS& env, const IRInstruction* inst) {
   auto const& exnStack = env.irb->exceptionStackState();
   always_assert_flog(
     exnStack.sp == sp(env) &&
@@ -58,8 +61,8 @@ void check_catch_stack_state(HTS& env, const IRInstruction* inst) {
     inst->toString(),
     sp(env)->toString(),
     exnStack.sp->toString(),
-    exnStack.syncedSpLevel,
-    env.irb->syncedSpLevel()
+    exnStack.syncedSpLevel.offset,
+    env.irb->syncedSpLevel().offset
   );
 }
 
@@ -78,7 +81,7 @@ void check_catch_stack_state(HTS& env, const IRInstruction* inst) {
  * which may or may not insert it depending on a variety of factors.
  */
 namespace detail {
-SSATmp* genInstruction(HTS& env, IRInstruction* inst) {
+SSATmp* genInstruction(IRGS& env, IRInstruction* inst) {
   if (inst->mayRaiseError() && inst->taken()) {
     FTRACE(1, "{}: asserting about catch block\n", inst->toString());
     /*
@@ -110,32 +113,48 @@ SSATmp* genInstruction(HTS& env, IRInstruction* inst) {
   }
 
   if (inst->mayRaiseError()) {
-    assert(inst->taken() && inst->taken()->isCatch());
+    assertx(inst->taken() && inst->taken()->isCatch());
   }
 
-  return env.irb->optimizeInst(inst, IRBuilder::CloneFlag::Yes, nullptr,
-    folly::none);
+  return env.irb->optimizeInst(inst, IRBuilder::CloneFlag::Yes, nullptr);
 }
 }
 
 //////////////////////////////////////////////////////////////////////
 
-void incTransCounter(HTS& env) { gen(env, IncTransCounter); }
+void incTransCounter(IRGS& env) { gen(env, IncTransCounter); }
 
-void incProfCounter(HTS& env, TransID transId) {
+void incProfCounter(IRGS& env, TransID transId) {
   gen(env, IncProfCounter, TransIDData(transId));
 }
 
-void checkCold(HTS& env, TransID transId) {
+void checkCold(IRGS& env, TransID transId) {
   gen(env, CheckCold, makeExitOpt(env, transId), TransIDData(transId));
 }
 
-void ringbuffer(HTS& env, Trace::RingBufferType t, SrcKey sk, int level) {
-  if (!Trace::moduleEnabledRelease(Trace::ringbuffer, level)) return;
-  gen(env, RBTrace, RBTraceData(t, sk));
+void ringbufferEntry(IRGS& env, Trace::RingBufferType t, SrcKey sk, int level) {
+  if (!Trace::moduleEnabled(Trace::ringbuffer, level)) return;
+  gen(env, RBTraceEntry, RBEntryData(t, sk));
 }
 
-void prepareEntry(HTS& env) {
+void ringbufferMsg(IRGS& env,
+                   Trace::RingBufferType t,
+                   const StringData* msg,
+                   int level) {
+  if (!Trace::moduleEnabled(Trace::ringbuffer, level)) return;
+  gen(env, RBTraceMsg, RBMsgData(t, msg));
+}
+
+void prepareEntry(IRGS& env) {
+  /*
+   * If assertions are on, before we do anything, each region makes a call to a
+   * C++ function that checks the state of everything.
+   */
+  if (RuntimeOption::EvalHHIRGenerateAsserts) {
+    auto const data = IRSPOffsetData { offsetFromIRSP(env, BCSPOffset{0}) };
+    gen(env, DbgTraceCall, data, fp(env), sp(env));
+  }
+
   /*
    * We automatically hoist a load of the context to the beginning of every
    * region.  The reason is that it's trivially CSEable, so we might as well
@@ -144,72 +163,68 @@ void prepareEntry(HTS& env) {
   ldCtx(env);
 }
 
-void prepareForSideExit(HTS& env) { spillStack(env); }
+void prepareForSideExit(IRGS& env) { spillStack(env); }
 
-void endRegion(HTS& env) {
-  auto const nextSk = curSrcKey(env).advanced(curUnit(env));
-  endRegion(env, nextSk.offset());
+void endRegion(IRGS& env) {
+  auto const curSk  = curSrcKey(env);
+  if (!instrAllowsFallThru(curSk.op())) return; // nothing to do here
+
+  auto const nextSk = curSk.advanced(curUnit(env));
+  endRegion(env, nextSk);
 }
 
-void endRegion(HTS& env, Offset nextPc) {
+void endRegion(IRGS& env, SrcKey nextSk) {
   FTRACE(1, "------------------- endRegion ---------------------------\n");
   if (!fp(env)) {
     // The function already returned.  There's no reason to generate code to
     // try to go to the next part of it.
     return;
   }
-  if (nextPc >= curFunc(env)->past()) {
-    // We have fallen off the end of the func's bytecodes. This happens
-    // when the function's bytecodes end with an unconditional
-    // backwards jump so that nextPc is out of bounds and causes an
-    // assertion failure in unit.cpp. The common case for this comes
-    // from the default value funclets, which are placed after the end
-    // of the function, with an unconditional branch back to the start
-    // of the function. So you should see this in any function with
-    // default params.
-    return;
-  }
-  prepareForNextHHBC(env, nullptr, nextPc, true);
   spillStack(env);
-  auto dest = SrcKey{curSrcKey(env), nextPc};
-  gen(env, AdjustSP, StackOffset { offsetFromSP(env, 0) }, sp(env));
-  gen(env, ReqBindJmp, ReqBindJmpData { dest }, sp(env));
+  auto const data = ReqBindJmpData {
+    nextSk,
+    invSPOff(env),
+    offsetFromIRSP(env, BCSPOffset{0}),
+    TransFlags{}
+  };
+  gen(env, ReqBindJmp, data, sp(env), fp(env));
+}
+
+void sealUnit(IRGS& env) {
+  mandatoryDCE(env.unit);
+}
+
+Type predictedTypeFromLocal(const IRGS& env, uint32_t locId) {
+  return env.irb->predictedLocalType(locId);
+}
+
+Type predictedTypeFromStack(const IRGS& env, BCSPOffset offset) {
+  if (offset < env.irb->evalStack().size()) {
+    return env.irb->evalStack().topPredictedType(offset.offset);
+  }
+  return env.irb->predictedStackType(offsetFromIRSP(env, offset));
 }
 
 // All accesses to the stack and locals in this function use DataTypeGeneric so
 // this function should only be used for inspecting state; when the values are
 // actually used they must be constrained further.
-Type predictedTypeFromLocation(HTS& env, const Location& loc) {
+Type predictedTypeFromLocation(const IRGS& env, const Location& loc) {
   switch (loc.space) {
-    case Location::Stack: {
-      auto i = loc.offset;
-      assert(i >= 0);
-      if (i < env.irb->evalStack().size()) {
-        return topType(env, i, DataTypeGeneric);
-      } else {
-        auto stackTy = env.irb->stackType(
-          offsetFromSP(env, i),
-          DataTypeGeneric
-        );
-        if (stackTy.isBoxed()) {
-          return env.irb->stackInnerTypePrediction(offsetFromSP(env, i)).box();
-        }
-        return stackTy;
-      }
-    } break;
+    case Location::Stack:
+      return predictedTypeFromStack(env, loc.bcRelOffset);
     case Location::Local:
-      return env.irb->predictedLocalType(loc.offset);
+      return predictedTypeFromLocal(env, loc.offset);
     case Location::Litstr:
       return Type::cns(curUnit(env)->lookupLitstrId(loc.offset));
     case Location::Litint:
       return Type::cns(loc.offset);
     case Location::This:
       // Don't specialize $this for cloned closures which may have been re-bound
-      if (curFunc(env)->hasForeignThis()) return Type::Obj;
+      if (curFunc(env)->hasForeignThis()) return TObj;
       if (auto const cls = curFunc(env)->cls()) {
-        return Type::Obj.specialize(cls);
+        return Type::SubObj(cls);
       }
-      return Type::Obj;
+      return TObj;
 
     case Location::Iter:
     case Location::Invalid:
@@ -218,7 +233,43 @@ Type predictedTypeFromLocation(HTS& env, const Location& loc) {
   not_reached();
 }
 
-void endBlock(HTS& env, Offset next, bool nextIsMerge) {
+Type provenTypeFromLocal(const IRGS& env, uint32_t locId) {
+  return env.irb->localType(locId, DataTypeGeneric);
+}
+
+Type provenTypeFromStack(const IRGS& env, BCSPOffset offset) {
+  if (offset < env.irb->evalStack().size()) {
+    return env.irb->evalStack().top(offset.offset)->type();
+  }
+  return env.irb->stackType(offsetFromIRSP(env, offset), DataTypeGeneric);
+}
+
+Type provenTypeFromLocation(const IRGS& env, const Location& loc) {
+  switch (loc.space) {
+  case Location::Stack:
+    return provenTypeFromStack(env, loc.bcRelOffset);
+  case Location::Local:
+    return provenTypeFromLocal(env, loc.offset);
+  case Location::Litstr:
+    return Type::cns(curUnit(env)->lookupLitstrId(loc.offset));
+  case Location::Litint:
+    return Type::cns(loc.offset);
+  case Location::This:
+    // Don't specialize $this for cloned closures which may have been re-bound
+    if (curFunc(env)->hasForeignThis()) return TObj;
+    if (auto const cls = curFunc(env)->cls()) {
+      return Type::SubObj(cls);
+    }
+    return TObj;
+
+  case Location::Iter:
+  case Location::Invalid:
+    break;
+  }
+  not_reached();
+}
+
+void endBlock(IRGS& env, Offset next, bool nextIsMerge) {
   if (!fp(env)) {
     // If there's no fp, we've already executed a RetCtrl or similar, so
     // there's no reason to try to jump anywhere now.
@@ -227,38 +278,55 @@ void endBlock(HTS& env, Offset next, bool nextIsMerge) {
   jmpImpl(env, next, nextIsMerge ? JmpFlagNextIsMerge : JmpFlagNone);
 }
 
-void prepareForNextHHBC(HTS& env,
+void prepareForNextHHBC(IRGS& env,
                         const NormalizedInstruction* ni,
-                        Offset newOff,
-                        bool lastBcOff) {
+                        SrcKey newSk,
+                        bool lastBcInst) {
   FTRACE(1, "------------------- prepareForNextHHBC ------------------\n");
   env.currentNormalizedInstruction = ni;
 
-  always_assert_log(
-    IMPLIES(isInlining(env), !env.lastBcOff),
-    [&] {
-      return folly::format("Tried to end trace while inlining:\n{}",
-                           env.unit).str();
-    }
+  always_assert_flog(
+    IMPLIES(isInlining(env), !env.lastBcInst),
+    "Tried to end trace while inlining."
   );
 
-  env.bcStateStack.back().setOffset(newOff);
+  always_assert_flog(
+    IMPLIES(isInlining(env), !env.firstBcInst),
+    "Inlining while still at the first region instruction."
+  );
+
+  always_assert(env.bcStateStack.size() >= env.inlineLevel + 1);
+  auto pops = env.bcStateStack.size() - 1 - env.inlineLevel;
+  while (pops--) env.bcStateStack.pop_back();
+
+  always_assert_flog(env.bcStateStack.back().func() == newSk.func(),
+                     "Tried to update current SrcKey with a different func");
+
+  env.bcStateStack.back().setOffset(newSk.offset());
   updateMarker(env);
-  env.lastBcOff = lastBcOff;
+  env.lastBcInst = lastBcInst;
   env.catchCreator = nullptr;
   env.irb->prepareForNextHHBC();
 }
 
-size_t logicalStackDepth(const HTS& env) {
-  // Negate the offsetFromSP because it is an offset from the actual StkPtr (so
-  // negative values go deeper on the stack), but this function deals with
-  // logical stack depths (where more positive values are deeper).
-  return env.irb->spOffset() + -offsetFromSP(env, 0);
+void finishHHBC(IRGS& env) {
+  env.firstBcInst = false;
 }
 
-Type publicTopType(const HTS& env, int32_t idx) {
+void prepareForHHBCMergePoint(IRGS& env) {
+  spillStack(env);
+}
+
+FPInvOffset logicalStackDepth(const IRGS& env) {
+  // Negate the offsetFromIRSP because it is an offset from the actual StkPtr
+  // (so negative values go deeper on the stack), but this function deals with
+  // logical stack depths (where more positive values are deeper).
+  return env.irb->spOffset() - offsetFromIRSP(env, BCSPOffset{0});
+}
+
+Type publicTopType(const IRGS& env, BCSPOffset idx) {
   // It's logically const, because we're using DataTypeGeneric.
-  return topType(const_cast<HTS&>(env), idx, DataTypeGeneric);
+  return topType(const_cast<IRGS&>(env), idx, DataTypeGeneric);
 }
 
 //////////////////////////////////////////////////////////////////////

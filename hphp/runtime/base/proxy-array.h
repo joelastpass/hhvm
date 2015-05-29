@@ -182,7 +182,7 @@ public:
   static bool AdvanceMArrayIter(ArrayData*, MArrayIter&);
   static bool IsVectorData(const ArrayData*);
 
-  static ArrayData* EscalateForSort(ArrayData*);
+  static ArrayData* EscalateForSort(ArrayData*, SortFunction);
   static void Ksort(ArrayData*, int sort_flags, bool ascending);
   static void Sort(ArrayData*, int sort_flags, bool ascending);
   static void Asort(ArrayData*, int sort_flags, bool ascending);
@@ -205,7 +205,13 @@ private:
   static ArrayData* innerArr(const ArrayData* ad);
   friend class c_AwaitAllWaitHandle;
 
+public:
+  template<class F> void scan(F& mark) const {
+    mark(m_ref);
+  }
+
 private:
+  template <typename F> friend void scan(const ProxyArray& this_, F& mark);
   // The inner array. This is mutable since zend_hash_find() etc. has a
   // const ProxyArray* as a parameter, but we need to modify the inner array
   // to box and proxy the return values, so making this mutable avoids a

@@ -15,8 +15,10 @@
 */
 #include "hphp/runtime/vm/jit/irgen-call.h"
 
-#include "hphp/runtime/vm/jit/normalized-instruction.h"
 #include "hphp/runtime/vm/jit/mc-generator.h"
+#include "hphp/runtime/vm/jit/normalized-instruction.h"
+#include "hphp/runtime/vm/jit/type-constraint.h"
+#include "hphp/runtime/vm/jit/type.h"
 
 #include "hphp/runtime/vm/jit/irgen-exit.h"
 #include "hphp/runtime/vm/jit/irgen-create.h"
@@ -44,11 +46,9 @@ const Func* findCuf(Op op,
   invName = nullptr;
 
   const StringData* str =
-    callable->isA(Type::Str) && callable->isConst() ? callable->strVal()
-                                                    : nullptr;
+    callable->hasConstVal(TStr) ? callable->strVal() : nullptr;
   const ArrayData* arr =
-    callable->isA(Type::Arr) && callable->isConst() ? callable->arrVal()
-                                                    : nullptr;
+    callable->hasConstVal(TArr) ? callable->arrVal() : nullptr;
 
   StringData* sclass = nullptr;
   StringData* sname = nullptr;
@@ -116,17 +116,18 @@ bool canInstantiateClass(const Class* cls) {
 //////////////////////////////////////////////////////////////////////
 
 // Pushing for object method when we don't know the Func* statically.
-void fpushObjMethodUnknown(HTS& env,
+void fpushObjMethodUnknown(IRGS& env,
                            SSATmp* obj,
                            const StringData* methodName,
                            int32_t numParams,
                            bool shouldFatal) {
   spillStack(env);
   fpushActRec(env,
-              cns(env, Type::Nullptr),  // Will be set by LdObjMethod
+              cns(env, TNullptr),  // Will be set by LdObjMethod
               obj,
               numParams,
-              nullptr);
+              nullptr,
+              false);
   spillStack(env);
   auto const objCls = gen(env, LdObjClass, obj);
 
@@ -137,20 +138,21 @@ void fpushObjMethodUnknown(HTS& env,
 
   gen(env,
       LdObjMethod,
-      LdObjMethodData { offsetFromSP(env, 0), methodName, shouldFatal },
+      LdObjMethodData {
+        offsetFromIRSP(env, BCSPOffset{0}), methodName, shouldFatal
+      },
       objCls,
       sp(env));
 }
 
-void fpushObjMethodCommon(HTS& env,
+void fpushObjMethodCommon(IRGS& env,
                           SSATmp* obj,
                           const StringData* methodName,
                           int32_t numParams,
                           bool shouldFatal) {
   SSATmp* objOrCls = obj;
   const Class* baseClass = nullptr;
-  if (obj->type().isSpecialized()) {
-    auto cls = obj->type().getClass();
+  if (auto cls = obj->type().clsSpec().cls()) {
     if (!env.irb->constrainValue(obj, TypeConstraint(cls).setWeak())) {
       // If we know the class without having to specialize a guard any further,
       // use it.
@@ -172,13 +174,7 @@ void fpushObjMethodCommon(HTS& env,
         g_context->lookupObjMethod(func, baseClass, methodName, curClass(env),
                                    false);
       if (res == LookupResult::MethodFoundWithThis ||
-          /*
-           * TODO(#4455926): We don't allow vtable-style dispatch of
-           * abstract static methods, but not for any real reason
-           * here.  It should be able to work, but needs further
-           * testing to be enabled.
-           */
-          (res == LookupResult::MethodFoundNoThis && !func->isAbstract())) {
+          res == LookupResult::MethodFoundNoThis) {
         /*
          * If we found the func in baseClass, then either:
          *  a) its private, and this is always going to be the
@@ -206,7 +202,8 @@ void fpushObjMethodCommon(HTS& env,
                       funcTmp,
                       objOrCls,
                       numParams,
-                      magicCall ? methodName : nullptr);
+                      magicCall ? methodName : nullptr,
+                      false);
           return;
         }
       } else {
@@ -229,7 +226,7 @@ void fpushObjMethodCommon(HTS& env,
      * actrec before entering the "real" cloned closure body.
      */
     if (func->attrs() & AttrStatic && !func->isClosureBody()) {
-      assert(baseClass);
+      assertx(baseClass);
       gen(env, DecRef, obj);
       objOrCls = cns(env, baseClass);
     }
@@ -237,31 +234,33 @@ void fpushObjMethodCommon(HTS& env,
                 cns(env, func),
                 objOrCls,
                 numParams,
-                magicCall ? methodName : nullptr);
+                magicCall ? methodName : nullptr,
+                false);
     return;
   }
 
   fpushObjMethodUnknown(env, obj, methodName, numParams, shouldFatal);
 }
 
-void fpushFuncObj(HTS& env, int32_t numParams) {
+void fpushFuncObj(IRGS& env, int32_t numParams) {
   auto const slowExit = makeExitSlow(env);
   auto const obj      = popC(env);
   auto const cls      = gen(env, LdObjClass, obj);
   auto const func     = gen(env, LdObjInvoke, slowExit, cls);
-  fpushActRec(env, func, obj, numParams, nullptr);
+  fpushActRec(env, func, obj, numParams, nullptr, false);
 }
 
-void fpushFuncArr(HTS& env, int32_t numParams) {
+void fpushFuncArr(IRGS& env, int32_t numParams) {
   auto const thisAR = fp(env);
 
   auto const arr = popC(env);
   fpushActRec(
     env,
-    cns(env, Type::Nullptr),
-    cns(env, Type::Nullptr),
+    cns(env, TNullptr),
+    cns(env, TNullptr),
     numParams,
-    nullptr
+    nullptr,
+    false
   );
   spillStack(env);
 
@@ -271,30 +270,31 @@ void fpushFuncArr(HTS& env, int32_t numParams) {
   updateMarker(env);
   env.irb->exceptionStackBoundary();
 
-  gen(env, LdArrFuncCtx, StackOffset { offsetFromSP(env, 0) }, arr, sp(env),
-    thisAR);
+  gen(env, LdArrFuncCtx, IRSPOffsetData { offsetFromIRSP(env, BCSPOffset{0}) },
+    arr, sp(env), thisAR);
   gen(env, DecRef, arr);
 }
 
 // FPushCuf when the callee is not known at compile time.
-void fpushCufUnknown(HTS& env, Op op, int32_t numParams) {
+void fpushCufUnknown(IRGS& env, Op op, int32_t numParams) {
   if (op != Op::FPushCuf) {
     PUNT(fpushCufUnknown-nonFPushCuf);
   }
 
-  if (topC(env)->isA(Type::Obj)) return fpushFuncObj(env, numParams);
+  if (topC(env)->isA(TObj)) return fpushFuncObj(env, numParams);
 
-  if (!topC(env)->type().subtypeOfAny(Type::Arr, Type::Str)) {
+  if (!topC(env)->type().subtypeOfAny(TArr, TStr)) {
     PUNT(fpushCufUnknown);
   }
 
   auto const callable = popC(env);
   fpushActRec(
     env,
-    cns(env, Type::Nullptr),
-    cns(env, Type::Nullptr),
+    cns(env, TNullptr),
+    cns(env, TNullptr),
     numParams,
-    nullptr
+    nullptr,
+    false
   );
   spillStack(env);
 
@@ -308,14 +308,14 @@ void fpushCufUnknown(HTS& env, Op op, int32_t numParams) {
   updateMarker(env);
   env.irb->exceptionStackBoundary();
 
-  auto const opcode = callable->isA(Type::Arr) ? LdArrFPushCuf
+  auto const opcode = callable->isA(TArr) ? LdArrFPushCuf
                                                : LdStrFPushCuf;
-  gen(env, opcode, StackOffset { offsetFromSP(env, 0) }, callable, sp(env),
-    fp(env));
+  gen(env, opcode, IRSPOffsetData { offsetFromIRSP(env, BCSPOffset{0}) },
+    callable, sp(env), fp(env));
   gen(env, DecRef, callable);
 }
 
-SSATmp* clsMethodCtx(HTS& env, const Func* callee, const Class* cls) {
+SSATmp* clsMethodCtx(IRGS& env, const Func* callee, const Class* cls) {
   bool mustBeStatic = true;
 
   if (!(callee->attrs() & AttrStatic) &&
@@ -340,7 +340,7 @@ SSATmp* clsMethodCtx(HTS& env, const Func* callee, const Class* cls) {
   if (env.irb->thisAvailable()) {
     // might not be a static call and $this is available, so we know it's
     // definitely not static
-    assert(curClass(env));
+    assertx(curClass(env));
     auto this_ = ldThis(env);
     gen(env, IncRef, this_);
     return this_;
@@ -349,10 +349,10 @@ SSATmp* clsMethodCtx(HTS& env, const Func* callee, const Class* cls) {
   PUNT(getClsMethodCtx-MightNotBeStatic);
 }
 
-void implFPushCufOp(HTS& env, Op op, int32_t numArgs) {
+void implFPushCufOp(IRGS& env, Op op, int32_t numArgs) {
   const bool safe = op == OpFPushCufSafe;
   bool forward = op == OpFPushCufF;
-  SSATmp* callable = topC(env, safe ? 1 : 0);
+  SSATmp* callable = topC(env, BCSPOffset{safe ? 1 : 0});
 
   const Class* cls = nullptr;
   StringData* invName = nullptr;
@@ -381,7 +381,7 @@ void implFPushCufOp(HTS& env, Op op, int32_t numArgs) {
       ctx = clsMethodCtx(env, callee, cls);
     }
   } else {
-    ctx = cns(env, Type::Nullptr);
+    ctx = cns(env, TNullptr);
     if (!rds::isPersistentHandle(callee->funcHandle())) {
       // The miss path is complicated and rare. Punt for now.
       func = gen(env, LdFuncCachedSafe, LdFuncCachedData(callee->name()));
@@ -390,16 +390,16 @@ void implFPushCufOp(HTS& env, Op op, int32_t numArgs) {
   }
 
   auto const defaultVal = safe ? popC(env) : nullptr;
-  popDecRef(env, Type::Cell); // callable
+  popDecRef(env); // callable
   if (safe) {
     push(env, defaultVal);
     push(env, safeFlag);
   }
 
-  fpushActRec(env, func, ctx, numArgs, invName);
+  fpushActRec(env, func, ctx, numArgs, invName, false);
 }
 
-void fpushFuncCommon(HTS& env,
+void fpushFuncCommon(IRGS& env,
                      int32_t numParams,
                      const StringData* name,
                      const StringData* fallback) {
@@ -407,9 +407,10 @@ void fpushFuncCommon(HTS& env,
     if (func->isNameBindingImmutable(curUnit(env))) {
       fpushActRec(env,
                   cns(env, func),
-                  cns(env, Type::Nullptr),
+                  cns(env, TNullptr),
                   numParams,
-                  nullptr);
+                  nullptr,
+                  false);
       return;
     }
   }
@@ -419,12 +420,13 @@ void fpushFuncCommon(HTS& env,
     : gen(env, LdFuncCached, LdFuncCachedData { name });
   fpushActRec(env,
               ssaFunc,
-              cns(env, Type::Nullptr),
+              cns(env, TNullptr),
               numParams,
-              nullptr);
+              nullptr,
+              false);
 }
 
-void implUnboxR(HTS& env) {
+void implUnboxR(IRGS& env) {
   auto const exit = makeExit(env);
   auto const srcBox = popR(env);
   auto const unboxed = unbox(env, srcBox, exit);
@@ -443,18 +445,20 @@ void implUnboxR(HTS& env) {
 
 //////////////////////////////////////////////////////////////////////
 
-void fpushActRec(HTS& env,
+void fpushActRec(IRGS& env,
                  SSATmp* func,
                  SSATmp* objOrClass,
                  int32_t numArgs,
-                 const StringData* invName) {
+                 const StringData* invName,
+                 bool fromFPushCtor) {
   spillStack(env);
   auto const returnSPOff = env.irb->syncedSpLevel();
 
   ActRecInfo info;
-  info.spOffset = offsetFromSP(env, -int32_t{kNumActRecCells});
+  info.spOffset = offsetFromIRSP(env, BCSPOffset{-int32_t{kNumActRecCells}});
   info.numArgs = numArgs;
   info.invName = invName;
+  info.fromFPushCtor = fromFPushCtor;
   gen(
     env,
     SpillFrame,
@@ -464,23 +468,23 @@ void fpushActRec(HTS& env,
     objOrClass
   );
   auto const sframe = &env.irb->curBlock()->back();
-  assert(sframe->is(SpillFrame));
+  assertx(sframe->is(SpillFrame));
 
   env.fpiStack.push(FPIInfo { sp(env), returnSPOff, sframe });
 
-  assert(env.irb->stackDeficit() == 0);
+  assertx(env.irb->stackDeficit() == 0);
 }
 
 //////////////////////////////////////////////////////////////////////
 
-void emitFPushCufIter(HTS& env, int32_t numParams, int32_t itId) {
+void emitFPushCufIter(IRGS& env, int32_t numParams, int32_t itId) {
   spillStack(env);
   env.fpiStack.push(FPIInfo { sp(env), env.irb->spOffset(), nullptr });
   gen(
     env,
     CufIterSpillFrame,
     FPushCufData {
-      offsetFromSP(env, -int32_t{kNumActRecCells}),
+      offsetFromIRSP(env, BCSPOffset{-int32_t{kNumActRecCells}}),
       static_cast<uint32_t>(numParams),
       itId
     },
@@ -489,27 +493,26 @@ void emitFPushCufIter(HTS& env, int32_t numParams, int32_t itId) {
   );
 }
 
-void emitFPushCuf(HTS& env, int32_t numArgs) {
+void emitFPushCuf(IRGS& env, int32_t numArgs) {
   implFPushCufOp(env, Op::FPushCuf, numArgs);
 }
-void emitFPushCufF(HTS& env, int32_t numArgs) {
+void emitFPushCufF(IRGS& env, int32_t numArgs) {
   implFPushCufOp(env, Op::FPushCufF, numArgs);
 }
-void emitFPushCufSafe(HTS& env, int32_t numArgs) {
+void emitFPushCufSafe(IRGS& env, int32_t numArgs) {
   implFPushCufOp(env, Op::FPushCufSafe, numArgs);
 }
 
-void emitFPushCtor(HTS& env, int32_t numParams) {
+void emitFPushCtor(IRGS& env, int32_t numParams) {
   auto const cls  = popA(env);
   auto const func = gen(env, LdClsCtor, cls);
   auto const obj  = gen(env, AllocObj, cls);
   gen(env, IncRef, obj);
   pushIncRef(env, obj);
-  auto numArgsAndFlags = ActRec::encodeNumArgs(numParams, false, false, true);
-  fpushActRec(env, func, obj, numArgsAndFlags, nullptr);
+  fpushActRec(env, func, obj, numParams, nullptr, true /* fromFPushCtor */);
 }
 
-void emitFPushCtorD(HTS& env,
+void emitFPushCtorD(IRGS& env,
                     int32_t numParams,
                     const StringData* className) {
   auto const cls = Unit::lookupClassOrUniqueClass(className);
@@ -538,7 +541,7 @@ void emitFPushCtorD(HTS& env,
   auto ssaCls = persistentCls
     ? cns(env, cls)
     : gen(env, LdClsCached, cns(env, className));
-  if (!ssaCls->isConst() && uniqueCls) {
+  if (!ssaCls->hasConstVal() && uniqueCls) {
     // If the Class is unique but not persistent, it's safe to use it as a
     // const after the LdClsCached, which will throw if the class can't be
     // defined.
@@ -551,48 +554,64 @@ void emitFPushCtorD(HTS& env,
                              : gen(env, AllocObj, ssaCls);
   gen(env, IncRef, obj);
   pushIncRef(env, obj);
-  auto numArgsAndFlags = ActRec::encodeNumArgs(numParams, false, false, true);
-  fpushActRec(env, ssaFunc, obj, numArgsAndFlags, nullptr);
+  fpushActRec(env, ssaFunc, obj, numParams, nullptr, true /* FromFPushCtor */);
 }
 
-void emitFPushFuncD(HTS& env, int32_t nargs, const StringData* name) {
+void emitFPushFuncD(IRGS& env, int32_t nargs, const StringData* name) {
   fpushFuncCommon(env, nargs, name, nullptr);
 }
 
-void emitFPushFuncU(HTS& env,
+void emitFPushFuncU(IRGS& env,
                     int32_t nargs,
                     const StringData* name,
                     const StringData* fallback) {
   fpushFuncCommon(env, nargs, name, fallback);
 }
 
-void emitFPushFunc(HTS& env, int32_t numParams) {
-  if (topC(env)->isA(Type::Obj)) return fpushFuncObj(env, numParams);
-  if (topC(env)->isA(Type::Arr)) return fpushFuncArr(env, numParams);
+void emitFPushFunc(IRGS& env, int32_t numParams) {
+  if (topC(env)->isA(TObj)) return fpushFuncObj(env, numParams);
+  if (topC(env)->isA(TArr)) return fpushFuncArr(env, numParams);
 
-  if (!topC(env)->isA(Type::Str)) {
+  if (!topC(env)->isA(TStr)) {
     PUNT(FPushFunc_not_Str);
   }
 
   auto const funcName = popC(env);
   fpushActRec(env,
               gen(env, LdFunc, funcName),
-              cns(env, Type::Nullptr),
+              cns(env, TNullptr),
               numParams,
-              nullptr);
+              nullptr,
+              false);
 }
 
-void emitFPushObjMethodD(HTS& env,
+void emitFPushObjMethodD(IRGS& env,
                          int32_t numParams,
                          const StringData* methodName,
                          ObjMethodOp subop) {
   auto const obj = popC(env);
-  if (!obj->isA(Type::Obj)) PUNT(FPushObjMethodD-nonObj);
-  fpushObjMethodCommon(env, obj, methodName, numParams,
-    true /* shouldFatal */);
+
+  if (obj->type() <= TObj) {
+    fpushObjMethodCommon(env, obj, methodName, numParams,
+      true /* shouldFatal */);
+    return;
+  }
+
+  if (obj->type() <= TInitNull && subop == ObjMethodOp::NullSafe) {
+    fpushActRec(
+      env,
+      cns(env, SystemLib::s_nullFunc),
+      cns(env, TNullptr),
+      numParams,
+      nullptr,
+      false);
+    return;
+  }
+
+  PUNT(FPushObjMethodD-nonObj);
 }
 
-void emitFPushClsMethodD(HTS& env,
+void emitFPushClsMethodD(IRGS& env,
                          int32_t numParams,
                          const StringData* methodName,
                          const StringData* className) {
@@ -609,7 +628,8 @@ void emitFPushClsMethodD(HTS& env,
                 cns(env, func),
                 objOrCls,
                 numParams,
-                func && magicCall ? methodName : nullptr);
+                func && magicCall ? methodName : nullptr,
+                false);
     return;
   }
 
@@ -621,7 +641,6 @@ void emitFPushClsMethodD(HTS& env,
   // path. If that fails, slow exit.
   auto const func = cond(
     env,
-    0,
     [&] (Block* taken) {
       auto const mcFunc = gen(env, LdClsMethodCacheFunc, data);
       return gen(env, CheckNonNull, taken, mcFunc);
@@ -641,20 +660,21 @@ void emitFPushClsMethodD(HTS& env,
               func,
               clsCtx,
               numParams,
-              nullptr);
+              nullptr,
+              false);
 }
 
-void emitFPushClsMethod(HTS& env, int32_t numParams) {
+void emitFPushClsMethod(IRGS& env, int32_t numParams) {
   auto const clsVal  = popA(env);
   auto const methVal = popC(env);
 
-  if (!methVal->isA(Type::Str) || !clsVal->isA(Type::Cls)) {
+  if (!methVal->isA(TStr) || !clsVal->isA(TCls)) {
     PUNT(FPushClsMethod-unknownType);
   }
 
-  if (methVal->isConst()) {
+  if (methVal->hasConstVal()) {
     const Class* cls = nullptr;
-    if (clsVal->isConst()) {
+    if (clsVal->hasConstVal()) {
       cls = clsVal->clsVal();
     } else if (clsVal->inst()->op() == LdClsCctx) {
       /*
@@ -679,20 +699,21 @@ void emitFPushClsMethod(HTS& env, int32_t numParams) {
                                      cls,
                                      false);
       if (res == LookupResult::MethodFoundNoThis && func->isStatic()) {
-        auto funcTmp = clsVal->isConst()
+        auto funcTmp = clsVal->hasConstVal()
           ? cns(env, func)
           : gen(env, LdClsMethod, clsVal, cns(env, -(func->methodSlot() + 1)));
-        fpushActRec(env, funcTmp, clsVal, numParams, nullptr);
+        fpushActRec(env, funcTmp, clsVal, numParams, nullptr, false);
         return;
       }
     }
   }
 
   fpushActRec(env,
-              cns(env, Type::Nullptr),
-              cns(env, Type::Nullptr),
+              cns(env, TNullptr),
+              cns(env, TNullptr),
               numParams,
-              nullptr);
+              nullptr,
+              false);
   spillStack(env);
 
   /*
@@ -702,18 +723,19 @@ void emitFPushClsMethod(HTS& env, int32_t numParams) {
   updateMarker(env);
   env.irb->exceptionStackBoundary();
 
-  gen(env, LookupClsMethod, StackOffset { offsetFromSP(env, 0) }, clsVal,
-    methVal, sp(env), fp(env));
+  gen(env, LookupClsMethod,
+    IRSPOffsetData { offsetFromIRSP(env, BCSPOffset{0}) },
+    clsVal, methVal, sp(env), fp(env));
   gen(env, DecRef, methVal);
 }
 
-void emitFPushClsMethodF(HTS& env, int32_t numParams) {
+void emitFPushClsMethodF(IRGS& env, int32_t numParams) {
   auto const exitBlock = makeExitSlow(env);
 
-  auto classTmp = top(env, Type::Cls);
-  auto methodTmp = topC(env, 1, DataTypeGeneric);
-  assert(classTmp->isA(Type::Cls));
-  if (!classTmp->isConst() || !methodTmp->isConst(Type::Str)) {
+  auto classTmp = top(env);
+  auto methodTmp = topC(env, BCSPOffset{1}, DataTypeGeneric);
+  assertx(classTmp->isA(TCls));
+  if (!classTmp->hasConstVal() || !methodTmp->hasConstVal(TStr)) {
     PUNT(FPushClsMethodF-unknownClassOrMethod);
   }
   env.irb->constrainValue(methodTmp, DataTypeSpecific);
@@ -734,14 +756,13 @@ void emitFPushClsMethodF(HTS& env, int32_t numParams) {
     auto const funcTmp = cns(env, vmfunc);
     auto const newCtxTmp = gen(env, GetCtxFwdCall, curCtxTmp, funcTmp);
     fpushActRec(env, funcTmp, newCtxTmp, numParams,
-      (magicCall ? methName : nullptr));
+      magicCall ? methName : nullptr, false);
     return;
   }
 
   auto const data = ClsMethodData{cls->name(), methName};
   auto const funcTmp = cond(
     env,
-    0,
     [&](Block* taken) {
       auto const fcacheFunc = gen(env, LdClsMethodFCacheFunc, data);
       return gen(env, CheckNonNull, taken, fcacheFunc);
@@ -767,99 +788,122 @@ void emitFPushClsMethodF(HTS& env, int32_t numParams) {
               funcTmp,
               ctx,
               numParams,
-              magicCall ? methName : nullptr);
+              magicCall ? methName : nullptr,
+              false);
 }
 
 //////////////////////////////////////////////////////////////////////
 
-void emitFPassL(HTS& env, int32_t argNum, int32_t id) {
+/*
+ * All fpass instructions spill the stack after they execute, because we are
+ * sure to need that value in memory, regardless of whether we side-exit or
+ * throw.  At the level of HHBC semantics, it's illegal to pop them from the
+ * stack until we've left the FPI region, and we will be spilling the whole
+ * stack when we get to the FCall{D,} at the end of the region.  This should
+ * also potentially reduce the number of live registers during call sequences.
+ *
+ * Note: there is a general problem with the spillStack mechanism, in that it
+ * may sink stores that are not profitable to sink, but in this case we can
+ * work around it easily.
+ */
+
+void emitFPassL(IRGS& env, int32_t argNum, int32_t id) {
   if (env.currentNormalizedInstruction->preppedByRef) {
     emitVGetL(env, id);
   } else {
     emitCGetL(env, id);
   }
+  spillStack(env);
 }
 
-void emitFPassS(HTS& env, int32_t argNum) {
+void emitFPassS(IRGS& env, int32_t argNum) {
   if (env.currentNormalizedInstruction->preppedByRef) {
     emitVGetS(env);
   } else {
     emitCGetS(env);
   }
+  spillStack(env);
 }
 
-void emitFPassG(HTS& env, int32_t argNum) {
+void emitFPassG(IRGS& env, int32_t argNum) {
   if (env.currentNormalizedInstruction->preppedByRef) {
     emitVGetG(env);
   } else {
     emitCGetG(env);
   }
+  spillStack(env);
 }
 
-void emitFPassR(HTS& env, int32_t argNum) {
+void emitFPassR(IRGS& env, int32_t argNum) {
   if (env.currentNormalizedInstruction->preppedByRef) {
     PUNT(FPassR-byRef);
   }
 
   implUnboxR(env);
+  spillStack(env);
 }
 
-void emitFPassM(HTS& env, int32_t, int x) {
+void emitFPassM(IRGS& env, int32_t, int x) {
   if (env.currentNormalizedInstruction->preppedByRef) {
     emitVGetM(env, x);
   } else {
     emitCGetM(env, x);
   }
+  spillStack(env);
 }
 
-void emitUnboxR(HTS& env) { implUnboxR(env); }
+void emitUnboxR(IRGS& env) { implUnboxR(env); }
 
-void emitFPassV(HTS& env, int32_t argNum) {
+void emitFPassV(IRGS& env, int32_t argNum) {
   if (env.currentNormalizedInstruction->preppedByRef) {
     // FPassV is a no-op when the callee expects by ref.
     return;
   }
 
   auto const tmp = popV(env);
-  pushIncRef(env, gen(env, LdRef, Type::InitCell, tmp));
+  pushIncRef(env, gen(env, LdRef, TInitCell, tmp));
   gen(env, DecRef, tmp);
+  spillStack(env);
 }
 
-void emitFPassCE(HTS& env, int32_t argNum) {
+void emitFPassCE(IRGS& env, int32_t argNum) {
   if (env.currentNormalizedInstruction->preppedByRef) {
     // Need to raise an error
     PUNT(FPassCE-byRef);
   }
+  spillStack(env);
 }
 
-void emitFPassCW(HTS& env, int32_t argNum) {
+void emitFPassCW(IRGS& env, int32_t argNum) {
   if (env.currentNormalizedInstruction->preppedByRef) {
     // Need to raise a warning
     PUNT(FPassCW-byRef);
   }
+  spillStack(env);
 }
 
 //////////////////////////////////////////////////////////////////////
 
-void emitFCallArray(HTS& env) {
+void emitFCallArray(IRGS& env) {
   spillStack(env);
   auto const data = CallArrayData {
-    offsetFromSP(env, 0),
+    offsetFromIRSP(env, BCSPOffset{0}),
     bcOff(env),
     nextBcOff(env),
     callDestroysLocals(*env.currentNormalizedInstruction, curFunc(env))
   };
+  env.irb->exceptionStackBoundary();
   gen(env, CallArray, data, sp(env), fp(env));
 }
 
-void emitFCallD(HTS& env,
+void emitFCallD(IRGS& env,
                 int32_t numParams,
                 const StringData*,
                 const StringData*) {
   emitFCall(env, numParams);
 }
 
-void emitFCall(HTS& env, int32_t numParams) {
+void emitFCall(IRGS& env, int32_t numParams) {
   auto const returnBcOffset = nextBcOff(env) - curFunc(env)->base();
   auto const callee = env.currentNormalizedInstruction->funcd;
   auto const destroyLocals = callDestroysLocals(
@@ -868,11 +912,12 @@ void emitFCall(HTS& env, int32_t numParams) {
   );
 
   spillStack(env);
+  env.irb->exceptionStackBoundary();
   gen(
     env,
     Call,
     CallData {
-      offsetFromSP(env, 0),
+      offsetFromIRSP(env, BCSPOffset{0}),
       static_cast<uint32_t>(numParams),
       returnBcOffset,
       callee,
@@ -890,4 +935,3 @@ void emitFCall(HTS& env, int32_t numParams) {
 //////////////////////////////////////////////////////////////////////
 
 }}}
-

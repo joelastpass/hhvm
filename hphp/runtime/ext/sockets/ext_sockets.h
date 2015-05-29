@@ -18,7 +18,7 @@
 #ifndef incl_HPHP_EXT_SOCKET_H_
 #define incl_HPHP_EXT_SOCKET_H_
 
-#include "hphp/runtime/base/base-includes.h"
+#include "hphp/runtime/ext/extension.h"
 #include "hphp/util/network.h"
 #include "hphp/runtime/ext/stream/ext_stream.h"
 
@@ -122,9 +122,9 @@ void HHVM_FUNCTION(socket_close,
 String HHVM_FUNCTION(socket_strerror,
                      int errnum);
 int64_t HHVM_FUNCTION(socket_last_error,
-                      const Resource& socket = null_resource);
+                      const Variant& socket = null_variant);
 void HHVM_FUNCTION(socket_clear_error,
-                   const Resource& socket = null_resource);
+                   const Variant& socket = null_variant);
 Variant HHVM_FUNCTION(getaddrinfo,
                       const String& host,
                       const String& port,

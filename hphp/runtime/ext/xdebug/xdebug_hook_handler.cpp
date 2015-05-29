@@ -18,8 +18,13 @@
 #include "hphp/runtime/ext/xdebug/xdebug_hook_handler.h"
 
 #include "hphp/runtime/base/file.h"
+
+#include "hphp/runtime/ext/xdebug/php5_xdebug/xdebug_xml.h"
+#include "hphp/runtime/ext/xdebug/xdebug_command.h"
+
 #include "hphp/runtime/vm/hhbc.h"
 #include "hphp/runtime/vm/runtime.h"
+#include "hphp/runtime/vm/vm-regs.h"
 
 namespace HPHP {
 
@@ -44,7 +49,7 @@ static void add_func_breakpoint(int id,
                                 XDebugBreakpoint& bp,
                                 const Func* func) {
   // Function id is added to the breakpoint once matched
-  int func_id = func->getFuncId();
+  auto const func_id = func->getFuncId();
   bp.funcId = func_id;
 
   // Add the appropriate function map
@@ -104,8 +109,8 @@ static const Unit* find_unit(String filename) {
   // Search the given filename in the list of evaled files. We translate each
   // unit's filename to a canonical format, which is slow, but necessary.
   for (auto& kv : g_context->m_evaledFiles) {
-    const Unit* unit = kv.second;
-    String ufilename(unit->filepath()->data(), CopyString);
+    auto const unit = kv.second;
+    String ufilename(const_cast<StringData*>(unit->filepath()));
     if (filename == File::TranslatePath(ufilename)) {
       return unit;
     }
@@ -118,7 +123,7 @@ static const Unit* find_unit(String filename) {
 
 // Adding a breakpoint. Returns a unique id for the breakpoint.
 int XDebugThreadBreakpoints::addBreakpoint(XDebugBreakpoint& bp) {
-  int id = s_xdebug_breakpoints->m_nextBreakpointId;
+  auto const id = s_xdebug_breakpoints->m_nextBreakpointId;
 
   // php5 xdebug only accepts multiple breakpoints of the same type for
   // line breakpoints. A useful addition might be to allow multiple of all
@@ -145,7 +150,7 @@ int XDebugThreadBreakpoints::addBreakpoint(XDebugBreakpoint& bp) {
 
       // If the file/line combo is invalid, throw an error
       if (!phpAddBreakPointLine(unit, bp.line)) {
-        throw XDebugServer::ERROR_BREAKPOINT_INVALID;
+        throw XDebugError::BreakpointInvalid;
       }
       add_line_breakpoint(id, bp, unit);
       break;
@@ -169,7 +174,7 @@ int XDebugThreadBreakpoints::addBreakpoint(XDebugBreakpoint& bp) {
       if (func != nullptr) {
         add_func_breakpoint(id, bp, func);
       } else if (!bp.className.isNull() && cls != nullptr) {
-        throw XDebugServer::ERROR_BREAKPOINT_INVALID;
+        throw XDebugError::BreakpointInvalid;
       } else {
         UNMATCHED.insert(id);
       }
@@ -190,7 +195,7 @@ void XDebugThreadBreakpoints::removeBreakpoint(int id) {
   if (bp_iter == BREAKPOINT_MAP.end()) {
     return;
   }
-  const XDebugBreakpoint& bp = bp_iter->second;
+  auto const& bp = bp_iter->second;
 
   // Remove the breakpoint from the unmatched set. This will return 0
   // if the breakpoint is not in the set and so the breakpoint is not unmatched
@@ -274,7 +279,7 @@ bool XDebugThreadBreakpoints::updateBreakpointHitCondition(
     return false;
   }
 
-  XDebugBreakpoint& bp = iter->second;
+  auto& bp = iter->second;
   bp.hitCondition = con;
   return true;
 }
@@ -285,7 +290,7 @@ bool XDebugThreadBreakpoints::updateBreakpointHitValue(int id, int hitValue) {
     return false;
   }
 
-  XDebugBreakpoint& bp = iter->second;
+  auto& bp = iter->second;
   bp.hitValue = hitValue;
   return true;
 }
@@ -350,12 +355,12 @@ static bool is_breakpoint_hit(XDebugBreakpoint& bp) {
   // breakpoints before/after the evaluation in order to prevent
   // a breakpoint from being hit within this check
   if (type == BreakType::LINE && bp.conditionUnit != nullptr) {
-    bool prev_disabled = g_context->m_dbgNoBreak;
+    auto const prev_disabled = g_context->m_dbgNoBreak;
     g_context->m_dbgNoBreak = true;
 
     Variant result;
-    bool failure = g_context->evalPHPDebugger((TypedValue*) &result,
-                                               bp.conditionUnit, 0);
+    auto const failure = g_context->evalPHPDebugger((TypedValue*) &result,
+                                                     bp.conditionUnit, 0);
     g_context->m_dbgNoBreak = prev_disabled;
     if (failure || !result.toBoolean()) {
       return false;
@@ -408,15 +413,15 @@ void XDebugHookHandler::onBreak(const BreakInfo& bi) {
 
   // Iterate. Note that we only tell the server to break once.
   bool have_broken = false;
-  for (int id : ids) {
+  for (auto const id : ids) {
     // Look up the breakpoint, ensure it's hittable
-    XDebugBreakpoint& bp = BREAKPOINT_MAP.at(id);
+    auto& bp = BREAKPOINT_MAP.at(id);
     if (!is_breakpoint_hit<type>(bp)) {
       continue;
     }
 
     // We only break once per location
-    bool temporary = bp.temporary; // breakpoint could be deleted
+    auto const temporary = bp.temporary; // breakpoint could be deleted
     if (!have_broken) {
       have_broken = true;
 
@@ -438,6 +443,50 @@ void XDebugHookHandler::onBreak(const BreakInfo& bi) {
 // Exception::getMessage method name
 const StaticString s_GET_MESSAGE("getMessage");
 
+void XDebugHookHandler::onOpcode(PC pc) {
+  auto server = XDEBUG_GLOBAL(Server);
+
+  // Likely case is that there was no break command.
+  auto brk = server->getAndClearBreak();
+  if (LIKELY(brk == nullptr)) {
+    return;
+  }
+
+  server->log("Request thread received break command");
+
+  VMRegAnchor _;
+
+  auto const unit = vmfp()->func()->unit();
+  auto const line = unit->getLineNumber(unit->offsetOf(pc));
+  auto const filepath = const_cast<StringData*>(unit->filepath());
+  auto const transpath = File::TranslatePath(String(filepath));
+
+  // XDebugServer::breakpoint will send the response for the command before the
+  // break command, but we first need to send a response for the break command.
+  auto response = xdebug_xml_node_init("response");
+  server->addXmlns(*response);
+
+  auto const& cmd_str  = brk->getCommandStr();
+  auto const& trans_id = brk->getTransactionId();
+
+  // Manually add status and reason.  XDebugServer still thinks we're running
+  // because we haven't run XDebugServer::breakpoint yet.
+  xdebug_xml_add_attribute(response, "status", "break");
+  xdebug_xml_add_attribute(response, "reason", "ok");
+
+  // Ditto with command, XDebugServer is tracking the command before the break.
+  xdebug_xml_add_attribute_dup(response, "command", cmd_str.data());
+  xdebug_xml_add_attribute_dup(response, "transaction_id", trans_id.data());
+
+  delete brk;
+
+  server->sendMessage(*response);
+  xdebug_xml_node_dtor(response);
+
+  // Now we can go into a command loop.
+  server->breakpoint(transpath, init_null(), init_null(), line);
+}
+
 void XDebugHookHandler::onExceptionThrown(ObjectData* exception) {
   // Grab the exception name and message
   const StringData* name = exception->getVMClass()->name();
@@ -449,8 +498,8 @@ void XDebugHookHandler::onExceptionThrown(ObjectData* exception) {
 void XDebugHookHandler::onFlowBreak(const Unit* unit, int line) {
   if (XDEBUG_GLOBAL(Server) != nullptr) {
     // Translate the unit filepath and then break
-    const String filepath = String(unit->filepath()->data(), CopyString);
-    const String transpath = File::TranslatePath(filepath);
+    auto const filepath = String(const_cast<StringData*>(unit->filepath()));
+    auto const transpath = File::TranslatePath(filepath);
     XDEBUG_GLOBAL(Server)->breakpoint(transpath, init_null(),
                                       init_null(), line);
   }
@@ -458,7 +507,7 @@ void XDebugHookHandler::onFlowBreak(const Unit* unit, int line) {
 
 void XDebugHookHandler::onFileLoad(Unit* unit) {
   // Translate the unit filename to match xdebug's internal format
-  String unit_path(unit->filepath()->data(), CopyString);
+  String unit_path(const_cast<StringData*>(unit->filepath()));
   String filename = File::TranslatePath(unit_path);
 
   // Loop over all unmatched breakpoints

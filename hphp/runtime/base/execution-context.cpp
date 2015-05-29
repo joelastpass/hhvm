@@ -35,18 +35,19 @@
 #include "hphp/runtime/base/array-iterator.h"
 #include "hphp/runtime/base/memory-manager.h"
 #include "hphp/runtime/base/sweepable.h"
-#include "hphp/runtime/server/server-stats.h"
 #include "hphp/runtime/base/request-local.h"
 #include "hphp/runtime/base/builtin-functions.h"
 #include "hphp/runtime/base/comparisons.h"
 #include "hphp/runtime/base/externals.h"
+#include "hphp/runtime/base/program-functions.h"
 #include "hphp/runtime/base/runtime-option.h"
 #include "hphp/runtime/base/type-conversions.h"
-#include "hphp/runtime/debugger/debugger.h"
 #include "hphp/runtime/base/unit-cache.h"
+#include "hphp/runtime/debugger/debugger.h"
 #include "hphp/runtime/ext/ext_system_profiler.h"
 #include "hphp/runtime/ext/std/ext_std_output.h"
 #include "hphp/runtime/ext/string/ext_string.h"
+#include "hphp/runtime/server/server-stats.h"
 #include "hphp/runtime/vm/jit/translator-inline.h"
 #include "hphp/runtime/vm/jit/translator.h"
 #include "hphp/runtime/vm/debugger-hook.h"
@@ -99,8 +100,7 @@ ExecutionContext::ExecutionContext()
   // the default on every request.
   hasSystemDefault = IniSetting::ResetSystemDefault("error_reporting");
   if (!hasSystemDefault) {
-    ThreadInfo::s_threadInfo.getNoCheck()->m_reqInjectionData.
-      setErrorReportingLevel(RuntimeOption::RuntimeErrorReportingLevel);
+    RID().setErrorReportingLevel(RuntimeOption::RuntimeErrorReportingLevel);
   }
 
   VariableSerializer::serializationSizeLimit =
@@ -169,8 +169,7 @@ String ExecutionContext::getMimeType() const {
       mimetype = mimetype.substr(0, pos);
     }
   } else if (m_transport && m_transport->getUseDefaultContentType()) {
-    mimetype =
-        ThreadInfo::s_threadInfo->m_reqInjectionData.getDefaultMimeType();
+    mimetype = RID().getDefaultMimeType();
   }
   return mimetype;
 }
@@ -390,6 +389,8 @@ const StaticString
   s_type("type"),
   s_name("name"),
   s_args("args"),
+  s_chunk_size("chunk_size"),
+  s_buffer_used("buffer_used"),
   s_default_output_handler("default output handler");
 
 Array ExecutionContext::obGetStatus(bool full) {
@@ -397,14 +398,16 @@ Array ExecutionContext::obGetStatus(bool full) {
   int level = 0;
   for (auto& buffer : m_buffers) {
     Array status;
-    status.set(s_level, level);
-    if (level < m_protectedLevel) {
-      status.set(s_type, 1);
+    if (level < m_protectedLevel || buffer.handler.isNull()) {
       status.set(s_name, s_default_output_handler);
-    } else {
       status.set(s_type, 0);
+    } else {
       status.set(s_name, buffer.handler);
+      status.set(s_type, 1);
     }
+    status.set(s_level, level);
+    status.set(s_chunk_size, buffer.chunk_size);
+    status.set(s_buffer_used, buffer.oss.size());
 
     if (full) {
       ret.append(status);
@@ -554,10 +557,8 @@ void ExecutionContext::onRequestShutdown() {
 }
 
 void ExecutionContext::executeFunctions(ShutdownType type) {
-  ThreadInfo::s_threadInfo->m_reqInjectionData.resetTimer(
-    RuntimeOption::PspTimeoutSeconds);
-  ThreadInfo::s_threadInfo->m_reqInjectionData.resetCPUTimer(
-    RuntimeOption::PspCpuTimeoutSeconds);
+  RID().resetTimer(RuntimeOption::PspTimeoutSeconds);
+  RID().resetCPUTimer(RuntimeOption::PspCpuTimeoutSeconds);
 
   if (!m_shutdowns.isNull() && m_shutdowns.exists(type)) {
     SCOPE_EXIT {
@@ -633,7 +634,7 @@ bool ExecutionContext::errorNeedsHandling(int errnum,
     throw Exception(folly::sformat("throwAllErrors: {}", errnum));
   }
   if (mode != ErrorThrowMode::Never || errorNeedsLogging(errnum) ||
-      ThreadInfo::s_threadInfo->m_reqInjectionData.hasTrackErrors()) {
+      RID().hasTrackErrors()) {
     return true;
   }
   if (callUserHandler) {
@@ -647,7 +648,7 @@ bool ExecutionContext::errorNeedsHandling(int errnum,
 
 bool ExecutionContext::errorNeedsLogging(int errnum) {
   auto level =
-    ThreadInfo::s_threadInfo->m_reqInjectionData.getErrorReportingLevel() |
+    RID().getErrorReportingLevel() |
     RuntimeOption::ForceErrorReportingLevel;
   return RuntimeOption::NoSilencer || (level & errnum) != 0;
 }
@@ -695,8 +696,8 @@ void ExecutionContext::handleError(const std::string& msg,
 
   // Potentially upgrade the error to E_USER_ERROR
   if (errnum & RuntimeOption::ErrorUpgradeLevel &
-      static_cast<int>(ErrorConstants::ErrorModes::UPGRADEABLE_ERROR)) {
-    errnum = static_cast<int>(ErrorConstants::ErrorModes::USER_ERROR);
+      static_cast<int>(ErrorMode::UPGRADEABLE_ERROR)) {
+    errnum = static_cast<int>(ErrorMode::USER_ERROR);
     mode = ErrorThrowMode::IfUnhandled;
   }
 
@@ -721,7 +722,7 @@ void ExecutionContext::handleError(const std::string& msg,
       (mode == ErrorThrowMode::IfUnhandled && !handled)) {
     DEBUGGER_ATTACHED_ONLY(phpDebuggerErrorHook(ee, errnum, msg));
     bool isRecoverable =
-      errnum == static_cast<int>(ErrorConstants::ErrorModes::RECOVERABLE_ERROR);
+      errnum == static_cast<int>(ErrorMode::RECOVERABLE_ERROR);
     auto exn = FatalErrorException(msg, ee.getBacktrace(), isRecoverable);
     exn.setSilent(!errorNeedsLogging(errnum));
     throw exn;
@@ -730,7 +731,7 @@ void ExecutionContext::handleError(const std::string& msg,
     VMRegAnchor _;
     auto fp = vmfp();
 
-    if (ThreadInfo::s_threadInfo->m_reqInjectionData.hasTrackErrors() && fp) {
+    if (RID().hasTrackErrors() && fp) {
       // Set $php_errormsg in the parent scope
       Variant varFrom(ee.getMessage());
       const auto tvFrom(varFrom.asTypedValue());
@@ -778,8 +779,8 @@ bool ExecutionContext::callUserErrorHandler(const Exception &e, int errnum,
     }
     try {
       ErrorStateHelper esh(this, ErrorState::ExecutingUserHandler);
-      VarEnv* v = g_context->getVarEnv();
-      Array context = v ? v->getDefinedVariables() : empty_array();
+      auto const ar = g_context->getFrameAtDepth(0);
+      auto const context = ar ? getDefinedVariables(ar) : empty_array();
       if (!same(vm_call_user_func
                 (m_userErrorHandlers.back().first,
                  make_packed_array(errnum, String(e.getMessage()),
@@ -797,14 +798,14 @@ bool ExecutionContext::callUserErrorHandler(const Exception &e, int errnum,
 
 bool ExecutionContext::onFatalError(const Exception &e) {
   MM().resetCouldOOM(isStandardRequest());
-  ThreadInfo::s_threadInfo.getNoCheck()->m_reqInjectionData.resetTimer();
+  RID().resetTimer();
 
   auto prefix = "\nFatal error: ";
-  int errnum = static_cast<int>(ErrorConstants::ErrorModes::FATAL_ERROR);
+  auto errnum = static_cast<int>(ErrorMode::FATAL_ERROR);
   auto const fatal = dynamic_cast<const FatalErrorException*>(&e);
   if (fatal && fatal->isRecoverable()) {
      prefix = "\nCatchable fatal error: ";
-     errnum = static_cast<int>(ErrorConstants::ErrorModes::RECOVERABLE_ERROR);
+     errnum = static_cast<int>(ErrorMode::RECOVERABLE_ERROR);
   }
 
   recordLastError(e, errnum);
@@ -872,8 +873,7 @@ void ExecutionContext::debuggerInfo(
     info.emplace_back("Max Memory", IDebuggable::FormatSize(newInt));
   }
   info.emplace_back("Max Time",
-    IDebuggable::FormatTime(ThreadInfo::s_threadInfo.getNoCheck()->
-                 m_reqInjectionData.getTimeout() * 1000));
+                    IDebuggable::FormatTime(RID().getTimeout() * 1000));
 }
 
 ///////////////////////////////////////////////////////////////////////////////

@@ -33,13 +33,13 @@
 #include "hphp/runtime/server/http-protocol.h"
 #include "hphp/runtime/ext/openssl/ext_openssl.h"
 #include "hphp/system/constants.h"
-#include "hphp/util/compression.h"
-#include "hphp/util/text-util.h"
-#include "hphp/util/service-data.h"
-#include "hphp/util/logger.h"
 #include "hphp/util/compatibility.h"
+#include "hphp/util/compression.h"
+#include "hphp/util/hardware-counter.h"
+#include "hphp/util/logger.h"
+#include "hphp/util/service-data.h"
+#include "hphp/util/text-util.h"
 #include "hphp/util/timer.h"
-#include "hphp/runtime/base/hardware-counter.h"
 #include "hphp/runtime/ext/string/ext_string.h"
 #include <folly/String.h>
 
@@ -587,7 +587,8 @@ bool Transport::setCookie(const String& name, const String& value, int64_t expir
      * so in order to force cookies to be deleted, even on MSIE, we
      * pick an expiry date in the past
      */
-    String sdt = DateTime(1, true).toString(DateTime::DateFormat::Cookie);
+    String sdt = makeSmartPtr<DateTime>(1, true)->
+      toString(DateTime::DateFormat::Cookie);
     cookie += name.data();
     cookie += "=deleted; expires=";
     cookie += sdt.data();
@@ -602,8 +603,8 @@ bool Transport::setCookie(const String& name, const String& value, int64_t expir
         return false;
       }
       cookie += "; expires=";
-      String sdt =
-        DateTime(expire, true).toString(DateTime::DateFormat::Cookie);
+      String sdt = makeSmartPtr<DateTime>(expire, true)->
+        toString(DateTime::DateFormat::Cookie);
       cookie += sdt.data();
       cookie += "; Max-Age=";
       String sdelta = toString( expire - time(0) );
@@ -679,8 +680,17 @@ void Transport::prepareHeaders(bool compressed, bool chunked,
     addHeaderImpl("Set-Cookie", iter->c_str());
   }
 
-  if (isCompressionEnabled()) {
-    addHeaderImpl("Vary", "Accept-Encoding");
+  if (RuntimeOption::ServerAddVaryEncoding) {
+    /*
+     * Our response may vary depending on the Accept-Encoding header if
+     *  - we compressed it, and compression was not forced; or
+     *  - we didn't compress it because the client does not accept gzip
+     */
+    if (compressed ?
+        m_compressionDecision != CompressionDecision::HasTo :
+        (isCompressionEnabled() && !acceptEncoding("gzip"))) {
+      addHeaderImpl("Vary", "Accept-Encoding");
+    }
   }
 
   if (compressed) {
@@ -714,8 +724,10 @@ void Transport::prepareHeaders(bool compressed, bool chunked,
 
   if (m_responseHeaders.find("Content-Type") == m_responseHeaders.end() &&
       m_responseCode != 304) {
-    std::string contentType = "text/html; charset="
-                              + IniSetting::Get("default_charset");
+    std::string contentType = "text/html";
+    if (IniSetting::Get("default_charset") != "") {
+      contentType += "; charset=" + IniSetting::Get("default_charset");
+    }
     addHeaderImpl("Content-Type", contentType.c_str());
   }
 
@@ -790,26 +802,23 @@ StringHolder Transport::prepareResponse(const void *data, int size,
     return std::move(response);
   }
 
-  String compression;
-  int compressionLevel = RuntimeOption::GzipCompressionLevel;
-  IniSetting::Get("zlib.output_compression", compression);
-  String on = makeStaticString("on");
-  if (HHVM_FN(strtolower)(compression) == on) {
-    String compressionLevelStr;
-    IniSetting::Get("zlib.output_compression_level", compressionLevelStr);
-    int level = compressionLevelStr.toInt64();
-    if (level > compressionLevel
-        && level <= RuntimeOption::GzipMaxCompressionLevel) {
-      compressionLevel = level;
-    }
-  }
-
-
   // There isn't that much need to gzip response, when it can fit into one
   // Ethernet packet (1500 bytes), unless we are doing chunked encoding,
-  // where we don't really know if next chunk will benefit from compresseion.
+  // where we don't really know if next chunk will benefit from compression.
   if (m_chunkedEncoding || size > 1000 ||
       m_compressionDecision == CompressionDecision::HasTo) {
+    String compression;
+    int compressionLevel = RuntimeOption::GzipCompressionLevel;
+    IniSetting::Get("zlib.output_compression", compression);
+    if (compression.size() == 2 && bstrcaseeq(compression.data(), "on", 2)) {
+      String compressionLevelStr;
+      IniSetting::Get("zlib.output_compression_level", compressionLevelStr);
+      int level = compressionLevelStr.toInt64();
+      if (level > compressionLevel &&
+          level <= RuntimeOption::GzipMaxCompressionLevel) {
+        compressionLevel = level;
+      }
+    }
     if (m_compressor == nullptr) {
       m_compressor = new StreamCompressor(compressionLevel,
                                           CODING_GZIP, true);
@@ -913,7 +922,7 @@ void Transport::sendRawInternal(const void *data, int size,
 
   m_responseSize += response.size();
   ServerStats::SetThreadMode(ServerStats::ThreadMode::Writing);
-  sendImpl(response.data(), response.size(), m_responseCode, chunked);
+  sendImpl(response.data(), response.size(), m_responseCode, chunked, false);
   ServerStats::SetThreadMode(ServerStats::ThreadMode::Processing);
 
   ServerStats::LogBytes(size);
@@ -924,12 +933,14 @@ void Transport::sendRawInternal(const void *data, int size,
 }
 
 void Transport::onSendEnd() {
+  bool eomSent = false;
   if (m_compressor && m_chunkedEncoding) {
+    assert(m_headerSent);
     bool compressed = false;
     StringHolder response = prepareResponse("", 0, compressed, true);
-    sendImpl(response.data(), response.size(), m_responseCode, true);
-  }
-  if (!m_headerSent) {
+    sendImpl(response.data(), response.size(), m_responseCode, true, true);
+    eomSent = true;
+  } else if (!m_headerSent) {
     m_compressionDecision = CompressionDecision::ShouldNot;
     sendRawInternal("", 0);
   }
@@ -937,7 +948,9 @@ void Transport::onSendEnd() {
     folly::to<std::string>(HTTP_RESPONSE_STATS_PREFIX, getResponseCode()),
     {ServiceData::StatsType::SUM});
   httpResponseStats->addValue(1);
-  onSendEndImpl();
+  if (!eomSent) {
+    onSendEndImpl();
+  }
   // Record that we have ended the request so any further output is discarded.
   m_sendEnded = true;
 }

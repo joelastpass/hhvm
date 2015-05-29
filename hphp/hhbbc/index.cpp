@@ -749,7 +749,7 @@ bool build_cls_info_rec(borrowed_ptr<ClassInfo> rleaf,
    * Duplicate class constants override parent class constants, but
    * for interfaces it's an error to have a duplicate constant, unless
    * it just happens from implementing the same interface more than
-   * once.
+   * once, or the constant is abstract.
    *
    * Note: hphpc doesn't actually check for this case, but since with
    * HardConstProp we're potentially doing propagation of these
@@ -760,7 +760,10 @@ bool build_cls_info_rec(borrowed_ptr<ClassInfo> rleaf,
   for (auto& c : rparent->cls->constants) {
     auto& cptr = rleaf->clsConstants[c.name];
     if (isIface && cptr) {
-      if (cptr->cls != rparent->cls) return false;
+      if (cptr->val.hasValue() && c.val.hasValue() &&
+          cptr->cls != rparent->cls) {
+        return false;
+      }
     }
     cptr = &c;
   }
@@ -1469,18 +1472,22 @@ folly::Optional<res::Class> Index::resolve_class(Context ctx,
                                                  SString clsName) const {
   clsName = normalizeNS(clsName);
 
+  // We know it has to name a class only if there's no type alias with this
+  // name.
+  //
+  // TODO(#3519401): when we start unfolding type aliases, we could
+  // look at whether it is an alias for a specific class here.
+  // (Note this might need to split into a different API: type
+  // aliases aren't allowed everywhere we're doing resolve_class
+  // calls.)
+  if (m_data->typeAliases.count(clsName)) {
+    return folly::none;
+  }
+
   auto name_only = [&] () -> folly::Optional<res::Class> {
-    // We know it has to name a class only if there's no type alias with this
-    // name.  We also refuse to have name-only resolutions of enums, so that
+    // We also refuse to have name-only resolutions of enums, so that
     // all name only resolutions can be treated as objects.
-    //
-    // TODO(#3519401): when we start unfolding type aliases, we could
-    // look at whether it is an alias for a specific class here.
-    // (Note this might need to split into a different API: type
-    // aliases aren't allowed everywhere we're doing resolve_class
-    // calls.)
-    if (!m_data->typeAliases.count(clsName) &&
-        !m_data->enums.count(clsName)) {
+    if (!m_data->enums.count(clsName)) {
       return res::Class { this, clsName };
     }
     return folly::none;
@@ -1753,13 +1760,9 @@ Index::resolve_func_fallback(Context ctx,
 }
 
 Type Index::lookup_constraint(Context ctx, const TypeConstraint& tc) const {
-  if (!tc.hasConstraint()) return TCell;
-
-  /*
-   * Type variable constraints are not used at runtime to enforce
-   * anything.
-   */
-  if (tc.isTypeVar()) return TCell;
+  assert(IMPLIES(
+    !tc.hasConstraint() || tc.isTypeVar() || tc.isTypeConstant(),
+    tc.isMixed()));
 
   /*
    * Soft hints (@Foo) are not checked.
@@ -1767,13 +1770,14 @@ Type Index::lookup_constraint(Context ctx, const TypeConstraint& tc) const {
   if (tc.isSoft()) return TCell;
 
   switch (tc.metaType()) {
-  case TypeConstraint::MetaType::Precise:
-    {
+    case AnnotMetaType::Precise: {
       auto const mainType = [&]() -> const Type {
         auto const dt = tc.underlyingDataType();
-        if (!dt) return TInitCell;
+        assert(dt.hasValue());
 
         switch (*dt) {
+        case KindOfUninit:       return TCell;
+        case KindOfNull:         return TNull;
         case KindOfBoolean:      return TBool;
         case KindOfInt64:        return TInt;
         case KindOfDouble:       return TDbl;
@@ -1800,25 +1804,33 @@ Type Index::lookup_constraint(Context ctx, const TypeConstraint& tc) const {
               : subObj(*rcls);
           }
           return TInitCell;
-        default:
+        case KindOfClass:
+        case KindOfRef:
           always_assert_flog(false, "Unexpected DataType");
           break;
         }
         return TInitCell;
       }();
 
-      return (mainType == TInitCell || !tc.isNullable()) ? mainType
+      return (mainType == TInitCell || !tc.isNullable())
+        ? mainType
         : opt(mainType);
     }
-  case TypeConstraint::MetaType::Self:
-  case TypeConstraint::MetaType::Parent:
-  case TypeConstraint::MetaType::Callable:
-    break;
-  case TypeConstraint::MetaType::Number:
-    return tc.isNullable() ? TOptNum : TNum;
-  case TypeConstraint::MetaType::ArrayKey:
-    // TODO(3774082): Support TInt | TStr type constraint
-    return TInitCell;
+    case AnnotMetaType::Mixed:
+      /*
+       * Here we handle "mixed", typevars, and some other ignored
+       * typehints (ex. "(function(..): ..)" typehints).
+       */
+      return TCell;
+    case AnnotMetaType::Self:
+    case AnnotMetaType::Parent:
+    case AnnotMetaType::Callable:
+      break;
+    case AnnotMetaType::Number:
+      return tc.isNullable() ? TOptNum : TNum;
+    case AnnotMetaType::ArrayKey:
+      // TODO(3774082): Support TInt | TStr type constraint
+      return TInitCell;
   }
 
   return TCell;
@@ -1831,18 +1843,18 @@ bool Index::satisfies_constraint(Context ctx, const Type t,
 
 Type Index::satisfies_constraint_helper(Context ctx,
                                         const TypeConstraint& tc) const {
-  if (!tc.hasConstraint() || tc.isTypeVar()) {
-    return TGen;
-  }
+  assert(IMPLIES(
+    !tc.hasConstraint() || tc.isTypeVar() || tc.isTypeConstant(),
+    tc.isMixed()));
 
   switch (tc.metaType()) {
-  case TypeConstraint::MetaType::Precise:
-    {
+    case AnnotMetaType::Precise: {
       auto const mainType = [&]() -> const Type {
         auto const dt = tc.underlyingDataType();
-        if (!dt) return TBottom;
-
+        assert(dt.hasValue());
         switch (*dt) {
+        case KindOfUninit:       return TBottom;
+        case KindOfNull:         return TNull;
         case KindOfBoolean:      return TBool;
         case KindOfInt64:        return TInt;
         case KindOfDouble:       return TDbl;
@@ -1861,26 +1873,33 @@ Type Index::satisfies_constraint_helper(Context ctx,
             return subObj(*rcls);
           }
           return TBottom;
-        default:
+        case KindOfClass:
+        case KindOfRef:
           always_assert_flog(false, "Unexpected DataType");
           break;
         }
         return TBottom;
       }();
-
       return (mainType == TBottom || !tc.isNullable()) ? mainType
         : opt(mainType);
     }
-  case TypeConstraint::MetaType::Self:
-  case TypeConstraint::MetaType::Parent:
-  case TypeConstraint::MetaType::Callable:
-    break;
-  case TypeConstraint::MetaType::Number:
-    return tc.isNullable() ? TOptNum : TNum;
-  case TypeConstraint::MetaType::ArrayKey:
-    // TODO(3774082): Support TInt | TStr type constraint
-    break;
+    case AnnotMetaType::Mixed:
+      /*
+       * Here we handle "mixed", typevars, and some other ignored
+       * typehints (ex. "(function(..): ..)" typehints).
+       */
+      return TGen;
+    case AnnotMetaType::Self:
+    case AnnotMetaType::Parent:
+    case AnnotMetaType::Callable:
+      break;
+    case AnnotMetaType::Number:
+      return tc.isNullable() ? TOptNum : TNum;
+    case AnnotMetaType::ArrayKey:
+      // TODO(3774082): Support TInt | TStr type constraint
+      break;
   }
+
   return TBottom;
 }
 
@@ -1892,8 +1911,8 @@ Type Index::lookup_class_constant(Context ctx,
 
   auto const it = cinfo->clsConstants.find(cnsName);
   if (it != end(cinfo->clsConstants)) {
-    if (!it->second->val.hasValue()) {
-      // This is an abstract class constant.
+    if (!it->second->val.hasValue() || it->second->isTypeconst) {
+      // This is an abstract class constant or typeconstant
       return TInitCell;
     }
     if (it->second->val.value().m_type == KindOfUninit) {
@@ -1964,7 +1983,7 @@ Index::lookup_closure_use_vars(borrowed_ptr<const php::Func> func) const {
   if (!numUseVars) return {};
   auto const it = m_data->closureUseVars.find(func->cls);
   if (it == end(m_data->closureUseVars)) {
-    return std::vector<Type>(numUseVars, TInitGen);
+    return std::vector<Type>(numUseVars, TGen);
   }
   return it->second;
 }

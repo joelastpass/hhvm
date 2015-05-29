@@ -17,9 +17,11 @@
 
 #include "hphp/runtime/ext/array/ext_array.h"
 
+#include "hphp/runtime/base/actrec-args.h"
 #include "hphp/runtime/base/array-data-defs.h"
 #include "hphp/runtime/base/array-init.h"
 #include "hphp/runtime/base/builtin-functions.h"
+#include "hphp/runtime/base/collections.h"
 #include "hphp/runtime/base/comparisons.h"
 #include "hphp/runtime/base/container-functions.h"
 #include "hphp/runtime/base/mixed-array.h"
@@ -33,6 +35,8 @@
 #include "hphp/runtime/vm/jit/translator.h"
 #include "hphp/runtime/vm/jit/translator-inline.h"
 #include "hphp/util/logger.h"
+
+#include <vector>
 
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
@@ -74,12 +78,6 @@ DEFINE_CONSTANT(UCOL_HIRAGANA_QUATERNARY_MODE);
 DEFINE_CONSTANT(UCOL_NUMERIC_COLLATION);
 
 #undef DEFINE_CONSTANT
-
-int countArguments() {
-  ActRec *ar = g_context->getStackFrame();
-  assert(ar);
-  return ar->numArgs();
-}
 
 Variant HHVM_FUNCTION(array_change_key_case,
                       const Variant& input,
@@ -308,7 +306,7 @@ bool HHVM_FUNCTION(array_key_exists,
   } else if (searchCell->m_type == KindOfObject) {
     ObjectData* obj = searchCell->m_data.pobj;
     if (obj->isCollection()) {
-      return collectionContains(obj, key);
+      return collections::contains(obj, key);
     }
     return HHVM_FN(array_key_exists)(key, toArray(search));
   } else {
@@ -436,7 +434,99 @@ static void php_array_merge_recursive(PointerSet &seen, bool check,
   }
 }
 
+Variant HHVM_FUNCTION(array_map, const Variant& callback,
+                                 const Variant& arr1,
+                                 const Array& _argv /* = null_array */) {
+  CallCtx ctx;
+  ctx.func = nullptr;
+  if (!callback.isNull()) {
+    CallerFrame cf;
+    vm_decode_function(callback, cf(), false, ctx);
+  }
+  const auto& cell_arr1 = *arr1.asCell();
+  if (UNLIKELY(!isContainer(cell_arr1))) {
+    raise_warning("array_map(): Argument #2 should be an array or collection");
+    return init_null();
+  }
+  if (LIKELY(_argv.empty())) {
+    // Handle the common case where the caller passed two
+    // params (a callback and a container)
+    if (!ctx.func) {
+      if (cell_arr1.m_type == KindOfArray) {
+        return arr1;
+      } else {
+        return arr1.toArray();
+      }
+    }
+    ArrayInit ret(getContainerSize(cell_arr1), ArrayInit::Map{});
+    bool keyConverted = (cell_arr1.m_type == KindOfArray);
+    if (!keyConverted) {
+      auto col_type = cell_arr1.m_data.pobj->collectionType();
+      keyConverted = !collectionAllowsIntStringKeys(col_type);
+    }
+    for (ArrayIter iter(arr1); iter; ++iter) {
+      Variant result;
+      g_context->invokeFuncFew((TypedValue*)&result, ctx, 1,
+                               iter.secondRefPlus().asCell());
+      // if keyConverted is false, it's possible that ret will have fewer
+      // elements than cell_arr1; keys int(1) and string('1') may both be
+      // present
+      ret.add(iter.first(), result, keyConverted);
+    }
+    return ret.toVariant();
+  }
+
+  // Handle the uncommon case where the caller passed a callback
+  // and two or more containers
+  ArrayIter* iters =
+    (ArrayIter*)smart_malloc(sizeof(ArrayIter) * (_argv.size() + 1));
+  size_t numIters = 0;
+  SCOPE_EXIT {
+    while (numIters--) iters[numIters].~ArrayIter();
+    smart_free(iters);
+  };
+  size_t maxLen = getContainerSize(cell_arr1);
+  (void) new (&iters[numIters]) ArrayIter(cell_arr1);
+  ++numIters;
+  for (ArrayIter it(_argv); it; ++it, ++numIters) {
+    const auto& c = *it.secondRefPlus().asCell();
+    if (UNLIKELY(!isContainer(c))) {
+      raise_warning("array_map(): Argument #%d should be an array or "
+                    "collection", (int)(numIters + 2));
+      (void) new (&iters[numIters]) ArrayIter(it.secondRefPlus().toArray());
+    } else {
+      (void) new (&iters[numIters]) ArrayIter(c);
+      size_t len = getContainerSize(c);
+      if (len > maxLen) maxLen = len;
+    }
+  }
+  PackedArrayInit ret_ai(maxLen);
+  for (size_t k = 0; k < maxLen; k++) {
+    PackedArrayInit params_ai(numIters);
+    for (size_t i = 0; i < numIters; ++i) {
+      if (iters[i]) {
+        params_ai.append(iters[i].secondRefPlus());
+        ++iters[i];
+      } else {
+        params_ai.append(init_null_variant);
+      }
+    }
+    Array params = params_ai.toArray();
+    if (ctx.func) {
+      Variant result;
+      g_context->invokeFunc((TypedValue*)&result,
+                              ctx.func, params, ctx.this_,
+                              ctx.cls, nullptr, ctx.invName);
+      ret_ai.append(result);
+    } else {
+      ret_ai.append(params);
+    }
+  }
+  return ret_ai.toVariant();
+}
+
 Variant HHVM_FUNCTION(array_merge,
+                      int64_t numArgs,
                       const Variant& array1,
                       const Variant& array2 /* = null_variant */,
                       const Array& args /* = null array */) {
@@ -444,7 +534,7 @@ Variant HHVM_FUNCTION(array_merge,
   Array ret = Array::Create();
   php_array_merge(ret, arr_array1);
 
-  if (UNLIKELY(countArguments() < 2)) return ret;
+  if (UNLIKELY(numArgs < 2)) return ret;
 
   getCheckedArray(array2);
   php_array_merge(ret, arr_array2);
@@ -452,7 +542,7 @@ Variant HHVM_FUNCTION(array_merge,
   for (ArrayIter iter(args); iter; ++iter) {
     Variant v = iter.second();
     if (!v.isArray()) {
-      throw_expected_array_exception();
+      throw_expected_array_exception("array_merge");
       return init_null();
     }
     const Array& arr_v = v.asCArrRef();
@@ -462,6 +552,7 @@ Variant HHVM_FUNCTION(array_merge,
 }
 
 Variant HHVM_FUNCTION(array_merge_recursive,
+                      int64_t numArgs,
                       const Variant& array1,
                       const Variant& array2 /* = null_variant */,
                       const Array& args /* = null array */) {
@@ -471,7 +562,7 @@ Variant HHVM_FUNCTION(array_merge_recursive,
   php_array_merge_recursive(seen, false, ret, arr_array1);
   assert(seen.empty());
 
-  if (UNLIKELY(countArguments() < 2)) return ret;
+  if (UNLIKELY(numArgs < 2)) return ret;
 
   getCheckedArray(array2);
   php_array_merge_recursive(seen, false, ret, arr_array2);
@@ -480,7 +571,7 @@ Variant HHVM_FUNCTION(array_merge_recursive,
   for (ArrayIter iter(args); iter; ++iter) {
     Variant v = iter.second();
     if (!v.isArray()) {
-      throw_expected_array_exception();
+      throw_expected_array_exception("array_merge_recursive");
       return init_null();
     }
     const Array& arr_v = v.asCArrRef();
@@ -593,9 +684,8 @@ Variant HHVM_FUNCTION(array_pop,
                       VRefParam containerRef) {
   const auto* container = containerRef->asCell();
   if (UNLIKELY(!isMutableContainer(*container))) {
-    raise_warning(
-      "%s() expects parameter 1 to be an array or mutable collection",
-      __FUNCTION__+2 /* remove the "f_" prefix */);
+    raise_warning("array_pop() expects parameter 1 to be an "
+                  "array or mutable collection");
     return init_null();
   }
   if (!getContainerSize(containerRef)) {
@@ -605,16 +695,7 @@ Variant HHVM_FUNCTION(array_pop,
     return containerRef.wrapped().toArrRef().pop();
   }
   assert(container->m_type == KindOfObject);
-  auto* obj = container->m_data.pobj;
-  assert(obj->isCollection());
-  switch (obj->getCollectionType()) {
-    case Collection::VectorType: return static_cast<c_Vector*>(obj)->t_pop();
-    case Collection::MapType:    return static_cast<c_Map*>(obj)->pop();
-    case Collection::SetType:    return static_cast<c_Set*>(obj)->pop();
-    default:                     break;
-  }
-  assert(false);
-  return init_null();
+  return collections::pop(container->m_data.pobj);
 }
 
 Variant HHVM_FUNCTION(array_product,
@@ -715,30 +796,39 @@ Variant HHVM_FUNCTION(array_push,
 
   if (container.isObject()) {
     ObjectData* obj = container.getObjectData();
-    auto collection_type = obj->getCollectionType();
-    if (collection_type == Collection::VectorType) {
-      c_Vector* vec = static_cast<c_Vector*>(obj);
-      vec->reserve(vec->size() + args.size() + 1);
-      vec->t_add(var);
-      for (ArrayIter iter(args); iter; ++iter) {
-        vec->t_add(iter.second());
+    if (obj->isCollection()) {
+      switch (obj->collectionType()) {
+        case CollectionType::Vector: {
+          c_Vector* vec = static_cast<c_Vector*>(obj);
+          vec->reserve(vec->size() + args.size() + 1);
+          vec->t_add(var);
+          for (ArrayIter iter(args); iter; ++iter) {
+            vec->t_add(iter.second());
+          }
+          return vec->size();
+        }
+        case CollectionType::Set: {
+          c_Set* set = static_cast<c_Set*>(obj);
+          set->reserve(set->size() + args.size() + 1);
+          set->t_add(var);
+          for (ArrayIter iter(args); iter; ++iter) {
+            set->t_add(iter.second());
+          }
+          return set->size();
+        }
+        case CollectionType::Map:
+        case CollectionType::Pair:
+        case CollectionType::ImmVector:
+        case CollectionType::ImmMap:
+        case CollectionType::ImmSet:
+          // other collection types are unsupported:
+          //  - mapping collections require a key
+          //  - immutable collections don't allow insertion
+          break;
       }
-      return vec->size();
-    } else if (collection_type == Collection::SetType) {
-      c_Set* set = static_cast<c_Set*>(obj);
-      set->reserve(set->size() + args.size() + 1);
-      set->t_add(var);
-      for (ArrayIter iter(args); iter; ++iter) {
-        set->t_add(iter.second());
-      }
-      return set->size();
     }
-    // other collection types are unsupported:
-    //  - mapping collections require a key
-    //  - frozen collections don't allow insertion
   }
-
-  throw_expected_array_or_collection_exception();
+  throw_expected_array_or_collection_exception("array_push");
   return init_null();
 }
 
@@ -799,41 +889,19 @@ Variant HHVM_FUNCTION(array_reverse,
 Variant HHVM_FUNCTION(array_shift,
                       VRefParam array) {
   const auto* cell_array = array->asCell();
-  if (UNLIKELY(!isContainer(*cell_array))) {
-    raise_warning(
-      "%s() expects parameter 1 to be an array or mutable collection",
-      __FUNCTION__+2 /* remove the "f_" prefix */);
+  if (UNLIKELY(!isMutableContainer(*cell_array))) {
+    raise_warning("array_shift() expects parameter 1 to be an "
+                  "array or mutable collection");
+    return init_null();
+  }
+  if (!getContainerSize(array)) {
     return init_null();
   }
   if (cell_array->m_type == KindOfArray) {
     return array.wrapped().toArrRef().dequeue();
   }
-  assert(cell_array->m_type == KindOfObject);
-  auto* obj = cell_array->m_data.pobj;
-  assert(obj->isCollection());
-  switch (obj->getCollectionType()) {
-    case Collection::VectorType: {
-      auto* vec = static_cast<c_Vector*>(obj);
-      if (!vec->size()) return init_null();
-      return vec->popFront();
-    }
-    case Collection::MapType: {
-      auto* mp = static_cast<BaseMap*>(obj);
-      if (!mp->size()) return init_null();
-      return mp->popFront();
-    }
-    case Collection::SetType: {
-      auto* st = static_cast<c_Set*>(obj);
-      if (!st->size()) return init_null();
-      return st->popFront();
-    }
-    default: {
-      raise_warning(
-        "%s() expects parameter 1 to be an array or mutable collection",
-        __FUNCTION__+2 /* remove the "f_" prefix */);
-      return init_null();
-    }
-  }
+  assertx(cell_array->m_type == KindOfObject);
+  return collections::shift(cell_array->m_data.pobj);
 }
 
 Variant HHVM_FUNCTION(array_slice,
@@ -867,23 +935,41 @@ Variant HHVM_FUNCTION(array_slice,
     return empty_array();
   }
 
-  // PackedArrayInit can't be used because non-numeric keys are preserved
-  // even when preserve_keys is false
-  Array ret = Array::attach(MixedArray::MakeReserve(len));
+  bool input_is_packed = isPackedContainer(cell_input);
+
+  // If the slice covers the entire input container, we can just nop when
+  // preserve_keys is true, or when preserve_keys is false but the container
+  // is packed so we know the keys already map to [0,N].
+  if (offset == 0 && len == num_in && (preserve_keys || input_is_packed)) {
+    return input.toArray();
+  }
+
   int pos = 0;
   ArrayIter iter(input);
   for (; pos < offset && iter; ++pos, ++iter) {}
-  for (; pos < (offset + len) && iter; ++pos, ++iter) {
-    Variant key(iter.first());
-    bool doAppend = !preserve_keys && key.isNumeric();
-    const Variant& v = iter.secondRefPlus();
-    if (doAppend) {
-      ret.appendWithRef(v);
-    } else {
-      ret.setWithRef(key, v, true);
+
+  if (input_is_packed && (offset == 0 || !preserve_keys)) {
+    PackedArrayInit ret(len);
+    for (; pos < (offset + len) && iter; ++pos, ++iter) {
+      ret.appendWithRef(iter.secondRefPlus());
     }
+    return ret.toVariant();
+  } else {
+    // Otherwise PackedArrayInit can't be used because non-numeric keys are
+    // preserved even when preserve_keys is false
+    Array ret = Array::attach(MixedArray::MakeReserve(len));
+    for (; pos < (offset + len) && iter; ++pos, ++iter) {
+      Variant key(iter.first());
+      bool doAppend = !preserve_keys && key.isNumeric();
+      const Variant& v = iter.secondRefPlus();
+      if (doAppend) {
+        ret.appendWithRef(v);
+      } else {
+        ret.setWithRef(key, v, true);
+      }
+    }
+    return ret;
   }
-  return ret;
 }
 
 Variant HHVM_FUNCTION(array_splice,
@@ -1025,8 +1111,8 @@ Variant HHVM_FUNCTION(array_unshift,
   assert(cell_array->m_type == KindOfObject);
   auto* obj = cell_array->m_data.pobj;
   assert(obj->isCollection());
-  switch (obj->getCollectionType()) {
-    case Collection::VectorType: {
+  switch (obj->collectionType()) {
+    case CollectionType::Vector: {
       auto* vec = static_cast<c_Vector*>(obj);
       if (!args.empty()) {
         auto pos_limit = args->iter_end();
@@ -1038,7 +1124,7 @@ Variant HHVM_FUNCTION(array_unshift,
       vec->addFront(var.asCell());
       return vec->size();
     }
-    case Collection::SetType: {
+    case CollectionType::Set: {
       auto* st = static_cast<c_Set*>(obj);
       if (!args.empty()) {
         auto pos_limit = args->iter_end();
@@ -1050,12 +1136,16 @@ Variant HHVM_FUNCTION(array_unshift,
       st->addFront(var.asCell());
       return st->size();
     }
-    default: {
-      raise_warning("%s() expects parameter 1 to be an array, Vector, or Set",
-                    __FUNCTION__+2 /* remove the "f_" prefix */);
-      return init_null();
-    }
+    case CollectionType::Map:
+    case CollectionType::Pair:
+    case CollectionType::ImmVector:
+    case CollectionType::ImmMap:
+    case CollectionType::ImmSet:
+      break;
   }
+  raise_warning("%s() expects parameter 1 to be an array, Vector, or Set",
+                __FUNCTION__+2 /* remove the "f_" prefix */);
+  return init_null();
 }
 
 Variant HHVM_FUNCTION(array_values,
@@ -1089,7 +1179,7 @@ bool HHVM_FUNCTION(array_walk_recursive,
                    const Variant& funcname,
                    const Variant& userdata /* = null_variant */) {
   if (!input.isArray()) {
-    throw_expected_array_exception();
+    throw_expected_array_exception("array_walk_recursive");
     return false;
   }
   CallCtx ctx;
@@ -1108,7 +1198,7 @@ bool HHVM_FUNCTION(array_walk,
                    const Variant& funcname,
                    const Variant& userdata /* = null_variant */) {
   if (!input.isArray()) {
-    throw_expected_array_exception();
+    throw_expected_array_exception("array_walk");
     return false;
   }
   CallCtx ctx;
@@ -1139,7 +1229,7 @@ Array HHVM_FUNCTION(compact,
                     const Array& args /* = null array */) {
   raise_disallowed_dynamic_call("compact should not be called dynamically");
   Array ret = Array::attach(MixedArray::MakeReserve(args.size() + 1));
-  VarEnv* v = g_context->getVarEnv();
+  VarEnv* v = g_context->getOrCreateVarEnv();
   if (v) {
     compact(v, ret, varname);
     compact(v, ret, args);
@@ -1152,7 +1242,7 @@ Array HHVM_FUNCTION(__SystemLib_compact_sl,
                     const Variant& varname,
                     const Array& args /* = null array */) {
   Array ret = Array::attach(MixedArray::MakeReserve(args.size() + 1));
-  VarEnv* v = g_context->getVarEnv();
+  VarEnv* v = g_context->getOrCreateVarEnv();
   if (v) {
     compact(v, ret, varname);
     compact(v, ret, args);
@@ -1175,7 +1265,7 @@ static int php_count_recursive(const Array& array) {
 bool HHVM_FUNCTION(shuffle,
                    VRefParam array) {
   if (!array.isArray()) {
-    throw_expected_array_exception();
+    throw_expected_array_exception("shuffle");
     return false;
   }
   array = ArrayUtil::Shuffle(array);
@@ -1476,7 +1566,9 @@ static int cmp_func(const Variant& v1, const Variant& v2, const void *data) {
 ///////////////////////////////////////////////////////////////////////////////
 // diff functions
 
-static inline void addToSetHelper(c_Set* st, const Cell c, TypedValue* strTv,
+static inline void addToSetHelper(const SmartPtr<c_Set>& st,
+                                  const Cell c,
+                                  TypedValue* strTv,
                                   bool convertIntLikeStrs) {
   if (c.m_type == KindOfInt64) {
     st->add(c.m_data.num);
@@ -1498,7 +1590,9 @@ static inline void addToSetHelper(c_Set* st, const Cell c, TypedValue* strTv,
   }
 }
 
-static inline bool checkSetHelper(c_Set* st, const Cell c, TypedValue* strTv,
+static inline bool checkSetHelper(const SmartPtr<c_Set>& st,
+                                  const Cell c,
+                                  TypedValue* strTv,
                                   bool convertIntLikeStrs) {
   if (c.m_type == KindOfInt64) {
     return st->contains(c.m_data.num);
@@ -1518,7 +1612,8 @@ static inline bool checkSetHelper(c_Set* st, const Cell c, TypedValue* strTv,
   return st->contains(s);
 }
 
-static void containerValuesToSetHelper(c_Set* st, const Variant& container) {
+static void containerValuesToSetHelper(const SmartPtr<c_Set>& st,
+                                       const Variant& container) {
   Variant strHolder(empty_string_variant());
   TypedValue* strTv = strHolder.asTypedValue();
   for (ArrayIter iter(container); iter; ++iter) {
@@ -1527,7 +1622,8 @@ static void containerValuesToSetHelper(c_Set* st, const Variant& container) {
   }
 }
 
-static void containerKeysToSetHelper(c_Set* st, const Variant& container) {
+static void containerKeysToSetHelper(const SmartPtr<c_Set>& st,
+                                     const Variant& container) {
   Variant strHolder(empty_string_variant());
   TypedValue* strTv = strHolder.asTypedValue();
   bool isKey = container.asCell()->m_type == KindOfArray;
@@ -1585,8 +1681,7 @@ Variant HHVM_FUNCTION(array_diff,
   // Put all of the values from all the containers (except container1 into a
   // Set. All types aside from integer and string will be cast to string, and
   // we also convert int-like strings to integers.
-  c_Set* st;
-  Object setObj = st = newobj<c_Set>();
+  auto st = makeSmartPtr<c_Set>();
   st->reserve(largestSize);
   containerValuesToSetHelper(st, container2);
   if (UNLIKELY(moreThanTwo)) {
@@ -1636,8 +1731,7 @@ Variant HHVM_FUNCTION(array_diff_key,
   // Put all of the keys from all the containers (except container1) into a
   // Set. All types aside from integer and string will be cast to string, and
   // we also convert int-like strings to integers.
-  c_Set* st;
-  Object setObj = st = newobj<c_Set>();
+  auto st = makeSmartPtr<c_Set>();
   st->reserve(largestSize);
   containerKeysToSetHelper(st, container2);
   if (UNLIKELY(moreThanTwo)) {
@@ -1779,7 +1873,7 @@ static inline TypedValue* makeContainerListHelper(const Variant& a,
   return containers;
 }
 
-static inline void addToIntersectMapHelper(c_Map* mp,
+static inline void addToIntersectMapHelper(const SmartPtr<c_Map>& mp,
                                            const Cell c,
                                            TypedValue* intOneTv,
                                            TypedValue* strTv,
@@ -1804,7 +1898,7 @@ static inline void addToIntersectMapHelper(c_Map* mp,
   }
 }
 
-static inline void updateIntersectMapHelper(c_Map* mp,
+static inline void updateIntersectMapHelper(const SmartPtr<c_Map>& mp,
                                             const Cell c,
                                             int pos,
                                             TypedValue* strTv,
@@ -1841,12 +1935,11 @@ static inline void updateIntersectMapHelper(c_Map* mp,
   }
 }
 
-static void containerValuesIntersectHelper(c_Set* st,
+static void containerValuesIntersectHelper(const SmartPtr<c_Set>& st,
                                            TypedValue* containers,
                                            int count) {
   assert(count >= 2);
-  c_Map* mp;
-  Object mapObj = mp = newobj<c_Map>();
+  auto mp = makeSmartPtr<c_Map>();
   Variant strHolder(empty_string_variant());
   TypedValue* strTv = strHolder.asTypedValue();
   TypedValue intOneTv = make_tv<KindOfInt64>(1);
@@ -1869,7 +1962,7 @@ static void containerValuesIntersectHelper(c_Set* st,
       updateIntersectMapHelper(mp, c, pos, strTv, true);
     }
   }
-  for (ArrayIter iter(mapObj); iter; ++iter) {
+  for (ArrayIter iter(mp.get()); iter; ++iter) {
     // For each key in the map, we copy the key to the set if the
     // corresponding value is equal to pos exactly (which means it
     // was present in all of the containers).
@@ -1881,12 +1974,11 @@ static void containerValuesIntersectHelper(c_Set* st,
   }
 }
 
-static void containerKeysIntersectHelper(c_Set* st,
+static void containerKeysIntersectHelper(const SmartPtr<c_Set>& st,
                                          TypedValue* containers,
                                          int count) {
   assert(count >= 2);
-  c_Map* mp;
-  Object mapObj = mp = newobj<c_Map>();
+  auto mp = makeSmartPtr<c_Map>();
   Variant strHolder(empty_string_variant());
   TypedValue* strTv = strHolder.asTypedValue();
   TypedValue intOneTv = make_tv<KindOfInt64>(1);
@@ -1908,7 +2000,7 @@ static void containerKeysIntersectHelper(c_Set* st,
       updateIntersectMapHelper(mp, c, pos, strTv, !isKey);
     }
   }
-  for (ArrayIter iter(mapObj); iter; ++iter) {
+  for (ArrayIter iter(mp.get()); iter; ++iter) {
     // For each key in the map, we copy the key to the set if the
     // corresponding value is equal to pos exactly (which means it
     // was present in all of the containers).
@@ -1964,8 +2056,7 @@ Variant HHVM_FUNCTION(array_intersect,
   ARRAY_INTERSECT_PRELUDE()
   // Build up a Set containing the values that are present in all the
   // containers (except container1)
-  c_Set* st;
-  Object setObj = st = newobj<c_Set>();
+  auto st = makeSmartPtr<c_Set>();
   if (LIKELY(!moreThanTwo)) {
     // There is only one container (not counting container1) so we can
     // just call containerValuesToSetHelper() to build the Set.
@@ -2020,8 +2111,7 @@ Variant HHVM_FUNCTION(array_intersect_key,
   }
   // Build up a Set containing the keys that are present in all the containers
   // (except container1)
-  c_Set* st;
-  Object setObj = st = newobj<c_Set>();
+  auto st = makeSmartPtr<c_Set>();
   if (LIKELY(!moreThanTwo)) {
     // There is only one container (not counting container1) so we can just
     // call containerKeysToSetHelper() to build the Set.
@@ -2240,14 +2330,13 @@ IMPLEMENT_STATIC_REQUEST_LOCAL(Collator, s_collator);
 namespace {
 class ArraySortTmp {
  public:
-  explicit ArraySortTmp(Array& arr) : m_arr(arr) {
-    m_ad = arr.get()->escalateForSort();
-    m_ad->incRefCount();
+  explicit ArraySortTmp(Array& arr, SortFunction sf) : m_arr(arr) {
+    m_ad = arr.get()->escalateForSort(sf);
+    assert(m_ad == arr.get() || m_ad->getCount() == 0);
   }
   ~ArraySortTmp() {
     if (m_ad != m_arr.get()) {
       m_arr = m_ad;
-      m_ad->decRefCount();
     }
   }
   ArrayData* operator->() { return m_ad; }
@@ -2270,13 +2359,15 @@ php_sort(VRefParam container, int sort_flags,
                              coll, &errcode);
       }
     }
-    ArraySortTmp ast(arr_array);
+    SortFunction sf = getSortFunction(SORTFUNC_SORT, ascending);
+    ArraySortTmp ast(arr_array, sf);
     ast->sort(sort_flags, ascending);
     return true;
   }
   if (container.isObject()) {
     ObjectData* obj = container.getObjectData();
-    if (obj->getCollectionType() == Collection::VectorType) {
+    if (obj->isCollection() &&
+        obj->collectionType() == CollectionType::Vector) {
       c_Vector* vec = static_cast<c_Vector*>(obj);
       vec->sort(sort_flags, ascending);
       return true;
@@ -2285,7 +2376,7 @@ php_sort(VRefParam container, int sort_flags,
     //  - Maps and Sets require associative sort
     //  - Immutable collections are not to be modified
   }
-  throw_expected_array_or_collection_exception();
+  throw_expected_array_or_collection_exception(ascending ? "sort" : "rsort");
   return false;
 }
 
@@ -2302,20 +2393,23 @@ php_asort(VRefParam container, int sort_flags,
                               coll, &errcode);
       }
     }
-    ArraySortTmp ast(arr_array);
+    SortFunction sf = getSortFunction(SORTFUNC_ASORT, ascending);
+    ArraySortTmp ast(arr_array, sf);
     ast->asort(sort_flags, ascending);
     return true;
   }
   if (container.isObject()) {
     ObjectData* obj = container.getObjectData();
-    if (obj->getCollectionType() == Collection::MapType ||
-        obj->getCollectionType() == Collection::SetType) {
-      HashCollection* hc = static_cast<HashCollection*>(obj);
-      hc->asort(sort_flags, ascending);
-      return true;
+    if (obj->isCollection()) {
+      auto type = obj->collectionType();
+      if (type == CollectionType::Map || type == CollectionType::Set) {
+        HashCollection* hc = static_cast<HashCollection*>(obj);
+        hc->asort(sort_flags, ascending);
+        return true;
+      }
     }
   }
-  throw_expected_array_or_collection_exception();
+  throw_expected_array_or_collection_exception(ascending ? "asort" : "arsort");
   return false;
 }
 
@@ -2332,20 +2426,23 @@ php_ksort(VRefParam container, int sort_flags, bool ascending,
                               coll, &errcode);
       }
     }
-    ArraySortTmp ast(arr_array);
+    SortFunction sf = getSortFunction(SORTFUNC_KRSORT, ascending);
+    ArraySortTmp ast(arr_array, sf);
     ast->ksort(sort_flags, ascending);
     return true;
   }
   if (container.isObject()) {
     ObjectData* obj = container.getObjectData();
-    if (obj->getCollectionType() == Collection::MapType ||
-        obj->getCollectionType() == Collection::SetType) {
-      HashCollection* hc = static_cast<HashCollection*>(obj);
-      hc->ksort(sort_flags, ascending);
-      return true;
+    if (obj->isCollection()) {
+      auto type = obj->collectionType();
+      if (type == CollectionType::Map || type == CollectionType::Set) {
+        HashCollection* hc = static_cast<HashCollection*>(obj);
+        hc->ksort(sort_flags, ascending);
+        return true;
+      }
     }
   }
-  throw_expected_array_or_collection_exception();
+  throw_expected_array_or_collection_exception(ascending ? "ksort" : "krsort");
   return false;
 }
 
@@ -2414,21 +2511,23 @@ bool HHVM_FUNCTION(usort,
       arr_array.sort(cmp_func, false, true, &cmp_function);
       return true;
     } else {
-      ArraySortTmp ast(arr_array);
+      ArraySortTmp ast(arr_array, SORTFUNC_USORT);
       return ast->usort(cmp_function);
     }
   }
   if (container.isObject()) {
     ObjectData* obj = container.getObjectData();
-    if (obj->getCollectionType() == Collection::VectorType) {
-      c_Vector* vec = static_cast<c_Vector*>(obj);
-      return vec->usort(cmp_function);
+    if (obj->isCollection()) {
+      if (obj->collectionType() == CollectionType::Vector) {
+        c_Vector* vec = static_cast<c_Vector*>(obj);
+        return vec->usort(cmp_function);
+      }
     }
     // other collections are not supported:
     //  - Maps and Sets require associative sort
     //  - Immutable collections are not to be modified
   }
-  throw_expected_array_or_collection_exception();
+  throw_expected_array_or_collection_exception("usort");
   return false;
 }
 
@@ -2441,22 +2540,24 @@ bool HHVM_FUNCTION(uasort,
       arr_array.sort(cmp_func, false, false, &cmp_function);
       return true;
     } else {
-      ArraySortTmp ast(arr_array);
+      ArraySortTmp ast(arr_array, SORTFUNC_UASORT);
       return ast->uasort(cmp_function);
     }
   }
   if (container.isObject()) {
     ObjectData* obj = container.getObjectData();
-    if (obj->getCollectionType() == Collection::MapType ||
-        obj->getCollectionType() == Collection::SetType) {
-      HashCollection* hc = static_cast<HashCollection*>(obj);
-      return hc->uasort(cmp_function);
+    if (obj->isCollection()) {
+      auto type = obj->collectionType();
+      if (type == CollectionType::Map || type == CollectionType::Set) {
+        HashCollection* hc = static_cast<HashCollection*>(obj);
+        return hc->uasort(cmp_function);
+      }
     }
     // other collections are not supported:
     //  - Vectors require a non-associative sort
     //  - Immutable collections are not to be modified
   }
-  throw_expected_array_or_collection_exception();
+  throw_expected_array_or_collection_exception("uasort");
   return false;
 }
 
@@ -2465,21 +2566,23 @@ bool HHVM_FUNCTION(uksort,
                    const Variant& cmp_function) {
   if (container.isArray()) {
     Array& arr_array = container.wrapped().toArrRef();
-    ArraySortTmp ast(arr_array);
+    ArraySortTmp ast(arr_array, SORTFUNC_UKSORT);
     return ast->uksort(cmp_function);
   }
   if (container.isObject()) {
     ObjectData* obj = container.getObjectData();
-    if (obj->getCollectionType() == Collection::MapType ||
-        obj->getCollectionType() == Collection::SetType) {
-      HashCollection* hc = static_cast<HashCollection*>(obj);
-      return hc->uksort(cmp_function);
+    if (obj->isCollection()) {
+      auto type = obj->collectionType();
+      if (type == CollectionType::Map || type == CollectionType::Set) {
+        HashCollection* hc = static_cast<HashCollection*>(obj);
+        return hc->uksort(cmp_function);
+      }
     }
     // other collections are not supported:
     //  - Vectors require a non-associative sort
     //  - Immutable collections are not to be modified
   }
-  throw_expected_array_or_collection_exception();
+  throw_expected_array_or_collection_exception("uksort");
   return false;
 }
 
@@ -2574,7 +2677,7 @@ static Array::PFUNC_CMP get_cmp_func(int sort_flags, bool ascending) {
 TypedValue* HHVM_FN(array_multisort)(ActRec* ar) {
   TypedValue* tv = getArg(ar, 0);
   if (tv == nullptr || !tvAsVariant(tv).isArray()) {
-    throw_expected_array_exception();
+    throw_expected_array_exception("array_multisort");
     return arReturn(ar, false);
   }
 
@@ -2624,6 +2727,10 @@ TypedValue* HHVM_FN(array_multisort)(ActRec* ar) {
 #define REGISTER_CONSTANT(name)                                                \
   Native::registerConstant<KindOfInt64>(s_##name.get(), k_##name)              \
 
+#define REGISTER_CONSTANT_VALUE(option, value)                                 \
+  Native::registerConstant<KindOfInt64>(makeStaticString("ARRAY_" #option),    \
+                                       (value));
+
 class ArrayExtension final : public Extension {
 public:
   ArrayExtension() : Extension("array") {}
@@ -2650,6 +2757,9 @@ public:
     REGISTER_CONSTANT(UCOL_HIRAGANA_QUATERNARY_MODE);
     REGISTER_CONSTANT(UCOL_NUMERIC_COLLATION);
 
+    REGISTER_CONSTANT_VALUE(FILTER_USE_BOTH, 1);
+    REGISTER_CONSTANT_VALUE(FILTER_USE_KEY,  2);
+
     HHVM_FE(array_change_key_case);
     HHVM_FE(array_chunk);
     HHVM_FE(array_column);
@@ -2661,6 +2771,7 @@ public:
     HHVM_FE(array_key_exists);
     HHVM_FE(key_exists);
     HHVM_FE(array_keys);
+    HHVM_FALIAS(__SystemLib\\array_map, array_map);
     HHVM_FE(array_merge_recursive);
     HHVM_FE(array_merge);
     HHVM_FE(array_replace_recursive);

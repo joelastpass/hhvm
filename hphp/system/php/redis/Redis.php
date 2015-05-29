@@ -225,8 +225,8 @@ class Redis {
         count($optionArrayOrExpiration) > 0) {
       $ex = array_key_exists('ex', $optionArrayOrExpiration);
       $px = array_key_exists('px', $optionArrayOrExpiration);
-      $nx = in_array('nx', $optionArrayOrExpiration);
-      $xx = in_array('xx', $optionArrayOrExpiration);
+      $nx = in_array('nx', $optionArrayOrExpiration, true);
+      $xx = in_array('xx', $optionArrayOrExpiration, true);
       if ($nx && $xx) {
         throw new RedisException(
           "Invalid set options: nx and xx may not be specified at the same time"
@@ -462,7 +462,7 @@ class Redis {
                                        $start,
                                        $end,
                                        array $opts = null) {
-    $args = [$this->_prefix($key), (int)$start, (int)$end];
+    $args = [$this->_prefix($key), $start, $end];
     if (isset($opts['limit']) AND
         is_array($opts['limit']) AND
         (count($opts['limit']) == 2)) {
@@ -574,6 +574,11 @@ class Redis {
   public function watch($key/* ... */) {
     $args = array_map([$this, '_prefix'], func_get_args());
     $this->processArrayCommand("WATCH", $args);
+    return $this->processBooleanResponse();
+  }
+
+  public function unwatch() {
+    $this->processCommand("UNWATCH");
     return $this->processBooleanResponse();
   }
 
@@ -942,11 +947,15 @@ class Redis {
   const TYPE_MULTIBULK = '*';
 
   protected function checkConnection($auto_reconnect = true) {
+    if (!$this->connection) {
+        return false;
+    }
+
     // Check if we have hit the stream timeout
     if (stream_get_meta_data($this->connection)['timed_out']) {
       throw new RedisException("read error on connection");
     }
-    if ($this->connection AND !feof($this->connection)) {
+    if (!feof($this->connection)) {
       // Connection seems fine
       return true;
     }
@@ -1254,7 +1263,7 @@ class Redis {
           ($type === self::TYPE_BULK && is_numeric($resp))) {
         return (float)$resp;
       }
-      return null;
+      return false;
     }
     $this->multiHandler[] = [ 'cb' => [$this,'processDoubleResponse'] ];
     if (($this->mode === self::MULTI) && !$this->processQueuedResponse()) {

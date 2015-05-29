@@ -97,11 +97,13 @@ public:
   static int64_t StringOffsetLimit;
 
   static std::string AccessLogDefaultFormat;
-  static std::vector<AccessLogFileData> AccessLogs;
+  static std::map<std::string, AccessLogFileData> AccessLogs;
 
   static std::string AdminLogFormat;
   static std::string AdminLogFile;
   static std::string AdminLogSymLink;
+
+  static std::map<std::string, AccessLogFileData> RPCLogs;
 
   static std::string Tier;
   static std::string Host;
@@ -109,8 +111,8 @@ public:
   static std::string ServerType;
   static std::string ServerIP;
   static std::string ServerFileSocket;
-  static std::string ServerPrimaryIPv4;
-  static std::string ServerPrimaryIPv6;
+  static const std::string& GetServerPrimaryIPv4();
+  static const std::string& GetServerPrimaryIPv6();
   static int ServerPort;
   static int ServerPortFd;
   static int ServerBacklog;
@@ -126,6 +128,7 @@ public:
   static bool ServerHttpSafeMode;
   static bool ServerStatCache;
   static bool ServerFixPathInfo;
+  static bool ServerAddVaryEncoding;
   static std::vector<std::string> ServerWarmupRequests;
   static boost::container::flat_set<std::string> ServerHighPriorityEndPoints;
   static bool ServerExitOnBindFail;
@@ -234,7 +237,6 @@ public:
   static bool Utf8izeReplace;
 
   static std::string StartupDocument;
-  static std::string WarmupDocument;
   static std::string RequestInitFunction;
   static std::string RequestInitDocument;
   static std::string AutoPrependFile;
@@ -293,6 +295,7 @@ public:
   static std::string StackTraceFilename;
   static bool LocalMemcache;
   static bool MemcacheReadOnly;
+  static int StackTraceTimeout;
 
   static bool EnableStats;
   static bool EnableAPCStats;
@@ -358,6 +361,7 @@ public:
   static HackStrictOption IconvIgnoreCorrect;
   static HackStrictOption MinMaxAllowDegenerate;
   static bool LookForTypechecker;
+  static bool AutoTypecheck;
 
   static int64_t HeapSizeMB;
   static int64_t HeapResetCountBase;
@@ -392,11 +396,25 @@ public:
   F(bool, Jit,                         evalJitDefault())                \
   F(bool, SimulateARM,                 simulateARMDefault())            \
   F(uint32_t, JitLLVM,                 jitLLVMDefault())                \
-  F(bool,     JitLLVMFastISel,         false)                           \
-  F(bool,     JitLLVMBasicOpt,         true)                            \
+  F(uint32_t, JitLLVMKeepSize,         0)                               \
   F(uint32_t, JitLLVMOptLevel,         2)                               \
   F(uint32_t, JitLLVMSizeLevel,        0)                               \
+  F(bool,     JitLLVMBBVectorize,      false)                           \
+  F(bool,     JitLLVMBasicOpt,         true)                            \
+  F(string,   JitLLVMCompare,          "")                              \
+  F(bool,     JitLLVMCondTail,         true)                            \
   F(bool,     JitLLVMCounters,         false)                           \
+  F(bool,     JitLLVMDiscard,          false)                           \
+  F(bool,     JitLLVMFastISel,         false)                           \
+  F(bool,     JitLLVMLoadCombine,      false)                           \
+  F(bool,     JitLLVMMinSize,          true)                            \
+  F(bool,     JitLLVMOptSize,          true)                            \
+  F(bool,     JitLLVMPrintAfterAll,    false)                           \
+  F(bool,     JitLLVMRetOpt,           true)                            \
+  F(bool,     JitLLVMSLPVectorize,     jitLLVMSLPVectorizeDefault())    \
+  F(uint32_t, JitLLVMSplitHotCold,     1)                               \
+  F(bool,     JitLLVMVolatileIncDec,   true)                            \
+  F(string,   JitLLVMAttrs,            "")                              \
   F(string,   JitCPU,                  "native")                        \
   F(bool, JitRequireWriteLease,        false)                           \
   F(uint64_t, JitAHotSize,             ahotDefault())                   \
@@ -405,10 +423,13 @@ public:
   F(uint64_t, JitAProfSize,            64 << 20)                        \
   F(uint64_t, JitAColdSize,            24 << 20)                        \
   F(uint64_t, JitAFrozenSize,          40 << 20)                        \
+  F(uint32_t, JitAutoTCShift,          1)                               \
   F(uint64_t, JitGlobalDataSize,       kJitGlobalDataDef)               \
   F(uint64_t, JitRelocationSize,       kJitRelocationSizeDefault)       \
   F(bool, JitTimer,                    kJitTimerDefault)                \
+  F(bool, RecordSubprocessTimes,       false)                           \
   F(bool, AllowHhas,                   false)                           \
+  F(bool, LogThreadCreateBacktraces,   false)                           \
   /* CheckReturnTypeHints:
      0 - No checks or enforcement for return type hints.
      1 - Raises E_WARNING if a return type hint fails.
@@ -436,6 +457,7 @@ public:
   F(bool, PerfPidMap,                  true)                            \
   F(bool, PerfDataMap,                 false)                           \
   F(bool, KeepPerfPidMap,              false)                           \
+  F(int32_t, PerfRelocate,             0)                               \
   F(uint32_t, JitTargetCacheSize,      64 << 20)                        \
   F(uint32_t, HHBCArenaChunkSize,      10 << 20)                        \
   F(bool, ProfileBC,                   false)                           \
@@ -463,48 +485,45 @@ public:
   F(bool, JitDisabledByHphpd,          false)                           \
   F(bool, JitTransCounters,            false)                           \
   F(bool, JitPseudomain,               jitPseudomainDefault())          \
-  F(bool, HHIRBytecodeControlFlow,     controlFlowDefault())            \
-  F(bool, HHIRCse,                     false)                           \
+  F(bool, HHIRLICM,                    false)                           \
   F(bool, HHIRSimplification,          true)                            \
   F(bool, HHIRGenOpts,                 true)                            \
-  F(bool, HHIRRefcountOpts,            refcountOptsDefault())           \
-  F(bool, HHIRRefcountOptsAlwaysSink,  false)                           \
-  F(bool, HHIRExtraOptPass,            true)                            \
-  F(uint32_t, HHIRNumFreeRegs,         64)                              \
+  F(bool, HHIRRefcountOpts,            true)                            \
   F(bool, HHIREnableGenTimeInlining,   true)                            \
   F(uint32_t, HHIRInliningMaxCost,     13)                              \
   F(uint32_t, HHIRInliningMaxDepth,    4)                               \
   F(uint32_t, HHIRInliningMaxReturnDecRefs, 3)                          \
   F(bool, HHIRInlineFrameOpts,         true)                            \
   F(bool, HHIRInlineSingletons,        true)                            \
-  /* 1 (the default) gives most asserts. 2 adds less commonly           \
-   * useful/more expensive asserts. */                                  \
-  F(uint32_t, HHIRGenerateAsserts,     debug)                           \
+  F(bool, HHIRGenerateAsserts,         debug)                           \
   F(bool, HHIRDirectExit,              true)                            \
   F(bool, HHIRDeadCodeElim,            true)                            \
   F(bool, HHIRGlobalValueNumbering,    true)                            \
   F(bool, HHIRPredictionOpts,          true)                            \
   F(bool, HHIRMemoryOpts,              true)                            \
-  F(bool, HHIRStressCodegenBlocks,     false)                           \
+  F(bool, HHIRStorePRE,                true)                            \
   /* Register allocation flags */                                       \
   F(bool, HHIREnablePreColoring,       true)                            \
   F(bool, HHIREnableCoalescing,        true)                            \
   F(bool, HHIRAllocSIMDRegs,           true)                            \
+  F(bool, HHIRStressSpill,             false)                           \
   /* Region compiler flags */                                           \
-  F(bool,     JitLoops,                loopsDefault())                  \
   F(string,   JitRegionSelector,       regionSelectorDefault())         \
   F(bool,     JitPGO,                  pgoDefault())                    \
   F(string,   JitPGORegionSelector,    pgoRegionSelectorDefault())      \
   F(uint64_t, JitPGOThreshold,         pgoThresholdDefault())           \
   F(bool,     JitPGOHotOnly,           false)                           \
+  F(bool,     JitPGOCFGHotFuncOnly,    false)                           \
   F(bool,     JitPGOUsePostConditions, true)                            \
   F(uint32_t, JitUnlikelyDecRefPercent,10)                              \
   F(uint32_t, JitPGOReleaseVVMinPercent, 10)                            \
-  F(bool,     JitPGOStringSpec,        false)                           \
   F(bool,     JitPGOArrayGetStress,    false)                           \
+  F(uint32_t, JitPGOMinBlockCountPercent, 10)                           \
+  F(double,   JitPGOMinArcProbability, 0.02)                            \
+  F(bool,     JitLoops,                loopsDefault())                  \
   F(uint32_t, HotFuncCount,            4100)                            \
-  F(bool, HHIRValidateRefCount,        debug)                           \
-  F(bool, HHIRRelaxGuards,             true)                            \
+  F(bool, HHIRConstrictGuards,         false)                           \
+  F(bool, HHIRRelaxGuards,             hhirRelaxGuardsDefault())        \
   /* DumpBytecode =1 dumps user php, =2 dumps systemlib & user php */   \
   F(int32_t, DumpBytecode,             0)                               \
   F(bool, DumpHhas,                    false)                           \
@@ -519,6 +538,7 @@ public:
   F(uint32_t, TCNumHugeColdMB,         4)                               \
   F(bool, RandomHotFuncs,              false)                           \
   F(bool, CheckHeapOnAlloc,            false)                           \
+  F(bool, EnableGC,                    false)                           \
   F(bool, DisableSomeRepoAuthNotices,  true)                            \
   F(uint32_t, InitialNamedEntityTableSize,  30000)                      \
   F(uint32_t, InitialStaticStringTableSize,                             \
@@ -586,6 +606,8 @@ public:
   static std::string DebuggerStartupDocument;
   static int DebuggerSignalTimeout;
 
+  static bool XDebugChrome;
+
   // Mail options
   static std::string SendmailPath;
   static std::string MailForceExtraParameters;
@@ -623,9 +645,6 @@ public:
   // Xenon options
   static double XenonPeriodSeconds;
   static bool XenonForceAlwaysOn;
-
-  static std::vector<void(*)(const IniSettingMap&, const Hdf&)>* OptionHooks;
-  static void AddOptionHook(void(*)(const IniSettingMap& ini, const Hdf&));
 
   // Convenience switch to turn on/off code alternatives via command-line
   // Do not commit code guarded by this flag, for evaluation only.

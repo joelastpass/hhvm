@@ -22,6 +22,7 @@
 
 #include "hphp/runtime/base/typed-value.h"
 #include "hphp/runtime/base/array-common.h"
+#include "hphp/runtime/base/sort-flags.h"
 
 namespace HPHP {
 
@@ -50,6 +51,7 @@ struct MixedArray;
  * details.
  */
 struct PackedArray {
+  static constexpr uint32_t MaxSize = 0xFFFFFFFFul;
   static void Release(ArrayData*);
   static const TypedValue* NvGetInt(const ArrayData*, int64_t ki);
   static const TypedValue* NvGetStr(const ArrayData*, const StringData*);
@@ -86,7 +88,7 @@ struct PackedArray {
   static ArrayData* CopyWithStrongIterators(const ArrayData*);
   static ArrayData* NonSmartCopy(const ArrayData*);
   static ArrayData* NonSmartCopyHelper(const ArrayData*);
-  static ArrayData* EscalateForSort(ArrayData*);
+  static ArrayData* EscalateForSort(ArrayData*, SortFunction);
   static void Ksort(ArrayData*, int, bool);
   static void Sort(ArrayData*, int, bool);
   static void Asort(ArrayData*, int, bool);
@@ -125,6 +127,7 @@ struct PackedArray {
   static uint32_t getMaxCapInPlaceFast(uint32_t cap);
 
   static size_t heapSize(const ArrayData*);
+  template<class Marker> static void scan(const ArrayData*, Marker&);
 
 private:
   static ArrayData* Grow(ArrayData*);
@@ -136,25 +139,7 @@ private:
   static ArrayData* CopyAndResizeIfNeededSlow(const ArrayData*);
   static ArrayData* CopyAndResizeIfNeeded(const ArrayData*);
   static ArrayData* ResizeIfNeeded(ArrayData*);
-
-public:
-  enum class Reason : uint8_t {
-    kForeachByRef,
-    kTakeByRef,
-    kSetRef,
-    kAppendRef,
-    kRemoveInt,
-    kRemoveStr,
-    kOutOfOrderIntKey,
-    kGetStr,
-    kSetStr,
-    kNumericString,
-    kPlusNotSupported,
-    kMergeNotSupported,
-    kSortNotSupported
-  };
-  static void downgradeAndWarn(ArrayData* ad, const Reason r);
-  static void warnUsage(const Reason r);
+  static SortFlavor preSort(ArrayData*);
 };
 
 //////////////////////////////////////////////////////////////////////

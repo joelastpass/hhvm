@@ -141,11 +141,18 @@ bool File::IsVirtualDirectory(const String& filename) {
     StaticContentCache::TheFileCache->dirExists(filename.data(), false);
 }
 
+bool File::IsVirtualFile(const String& filename) {
+  return
+    StaticContentCache::TheFileCache &&
+    StaticContentCache::TheFileCache->fileExists(filename.data(), false);
+}
+
 SmartPtr<File> File::Open(const String& filename, const String& mode,
                           int options /* = 0 */,
                           const SmartPtr<StreamContext>& context /* = null */) {
   Stream::Wrapper *wrapper = Stream::getWrapperFromURI(filename);
   if (!wrapper) return nullptr;
+  if (filename.find('\0') >= 0) return nullptr;
   auto rcontext = context ? context : g_context->getStreamContext();
   auto file = wrapper->open(filename, mode, options, rcontext);
   if (file) {

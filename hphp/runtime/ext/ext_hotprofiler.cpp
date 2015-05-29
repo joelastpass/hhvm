@@ -17,12 +17,10 @@
 
 #include "hphp/runtime/ext/ext_hotprofiler.h"
 
-#include "hphp/runtime/ext/ext_fb.h"
 #include "hphp/runtime/base/builtin-functions.h"
 #include "hphp/runtime/base/memory-manager.h"
 #include "hphp/runtime/base/request-local.h"
 #include "hphp/runtime/base/zend-math.h"
-#include "hphp/runtime/server/server-stats.h"
 #include "hphp/runtime/base/ini-setting.h"
 #include "hphp/runtime/vm/event-hook.h"
 #include "hphp/runtime/vm/jit/translator-inline.h"
@@ -33,6 +31,7 @@
 #include "hphp/runtime/ext/std/ext_std_function.h"
 #include "hphp/runtime/ext/ext_system_profiler.h"
 #include "hphp/runtime/ext/xdebug/xdebug_profiler.h"
+#include "hphp/runtime/ext/extension-registry.h"
 #include "hphp/runtime/base/request-event-handler.h"
 
 #include <sys/time.h>
@@ -53,7 +52,6 @@
 namespace HPHP {
 
 IMPLEMENT_DEFAULT_EXTENSION_VERSION(hotprofiler, NO_VERSION_YET);
-IMPLEMENT_DEFAULT_EXTENSION_VERSION(xhprof, 0.9.4);
 
 using std::vector;
 using std::string;
@@ -353,13 +351,14 @@ const StaticString
  */
 Profiler::Profiler(bool needCPUAffinity) : m_successful(true),
                                            m_stack(nullptr),
-                                           m_frame_free_list(nullptr) {
+                                           m_frame_free_list(nullptr),
+                                           m_has_affinity(needCPUAffinity) {
     if (!s_rand_initialized) {
       s_rand_initialized = true;
       srand(math_generate_seed());
     }
 
-    if (needCPUAffinity) {
+    if (m_has_affinity) {
       //
       // Bind to a random cpu so that we can use rdtsc instruction.
       //
@@ -378,7 +377,9 @@ Profiler::Profiler(bool needCPUAffinity) : m_successful(true),
 }
 
 Profiler::~Profiler() {
-    SET_AFFINITY(0, sizeof(cpu_set_t), &m_prev_mask);
+    if (m_has_affinity) {
+      SET_AFFINITY(0, sizeof(cpu_set_t), &m_prev_mask);
+    }
 
     endAllFrames();
     for (Frame *p = m_frame_free_list; p;) {
@@ -772,7 +773,7 @@ class TraceProfiler : public Profiler {
       m_successful = false;
     } else {
       m_maxTraceBuffer = RuntimeOption::ProfilerMaxTraceBuffer;
-      Extension* ext = Extension::GetExtension(s_hotprofiler);
+      Extension* ext = ExtensionRegistry::get(s_hotprofiler);
       assert(ext);
       IniSetting::Bind(ext, IniSetting::PHP_INI_ALL,
                        "profiler.max_trace_buffer",
@@ -854,10 +855,9 @@ class TraceProfiler : public Profiler {
                    m_traceBuffer[m_nextTraceEntry++]);
     }
     {
-      DECLARE_THREAD_INFO
-      MemoryManager::MaskAlloc masker(*info->m_mm);
-      TraceEntry *r = (TraceEntry*)realloc((void *)m_traceBuffer,
-                                           new_array_size * sizeof(TraceEntry));
+      MemoryManager::MaskAlloc masker(MM());
+      auto r = (TraceEntry*)realloc((void*)m_traceBuffer,
+                                    new_array_size * sizeof(TraceEntry));
 
       if (!r) {
         m_traceBufferFilled = true;
@@ -1181,8 +1181,7 @@ class MemoProfiler : public Profiler {
     // now. There's no reason not to do more later.
     if (!g_context->m_faults.empty()) return;
     if (ar->m_func->isCPPBuiltin() || ar->resumed()) return;
-    auto ret_tv = vmStack().topTV();
-    auto ret = tvAsCVarRef(ret_tv);
+    auto ret = tvAsCVarRef(retval);
     if (ret.isNull()) return;
     if (!(ret.isString() || ret.isObject() || ret.isArray())) return;
     VariableSerializer vs(VariableSerializer::Type::DebuggerSerialize);
@@ -1201,12 +1200,12 @@ class MemoProfiler : public Profiler {
       if (member_memo.m_return_value.length() == 0) { // First time
         member_memo.m_return_value = sdata;
         // Intentionally copy the raw pointer value
-        member_memo.m_ret_tv = *ret_tv;
+        member_memo.m_ret_tv = *retval;
         memo.m_ignore = false;
       } else if (member_memo.m_return_value == sdata) { // Same
         memo.m_ignore = false;
-        if ((member_memo.m_ret_tv.m_data.num != ret_tv->m_data.num) ||
-            (member_memo.m_ret_tv.m_type != ret_tv->m_type)) {
+        if ((member_memo.m_ret_tv.m_data.num != retval->m_data.num) ||
+            (member_memo.m_ret_tv.m_type != retval->m_type)) {
           memo.m_ret_tv_same = false;
         }
       } else {
@@ -1216,12 +1215,12 @@ class MemoProfiler : public Profiler {
       if (memo.m_return_value.length() == 0) { // First time
         memo.m_return_value = sdata;
         // Intentionally copy the raw pointer value
-        memo.m_ret_tv = *ret_tv;
+        memo.m_ret_tv = *retval;
         memo.m_ignore = false;
       } else if (memo.m_return_value == sdata) { // Same
         memo.m_ignore = false;
-        if ((memo.m_ret_tv.m_data.num != ret_tv->m_data.num) ||
-            (memo.m_ret_tv.m_type != ret_tv->m_type)) {
+        if ((memo.m_ret_tv.m_data.num != retval->m_data.num) ||
+            (memo.m_ret_tv.m_type != retval->m_type)) {
           memo.m_ret_tv_same = false;
         }
       } else {
@@ -1363,7 +1362,7 @@ bool ProfilerFactory::start(ProfilerKind kind,
     }
     break;
   default:
-    throw_invalid_argument("level: %d", kind);
+    throw_invalid_argument("level: %d", static_cast<int>(kind));
     return false;
   }
   if (m_profiler && m_profiler->m_successful) {
@@ -1430,111 +1429,6 @@ void f_phprof_enable(int flags /* = 0 */) {
 Variant f_phprof_disable() {
   return s_profiler_factory->stop();
 }
-
-void f_fb_setprofile(const Variant& callback) {
-  if (ThreadInfo::s_threadInfo->m_profiler != nullptr) {
-    // phpprof is enabled, don't let PHP code override it
-    return;
-  }
-  g_context->m_setprofileCallback = callback;
-  if (callback.isNull()) {
-    HPHP::EventHook::Disable();
-  } else {
-    HPHP::EventHook::Enable();
-  }
-}
-
-void f_xhprof_frame_begin(const String& name) {
-  Profiler *prof = ThreadInfo::s_threadInfo->m_profiler;
-  if (prof) {
-    s_profiler_factory->cacheString(name);
-    prof->beginFrame(name.data());
-  }
-}
-
-void f_xhprof_frame_end() {
-  Profiler *prof = ThreadInfo::s_threadInfo->m_profiler;
-  if (prof) {
-    prof->endFrame(nullptr, nullptr);
-  }
-}
-
-void f_xhprof_enable(int flags/* = 0 */,
-                     const Array& args /* = null_array */) {
-  if (!RuntimeOption::EnableHotProfiler) {
-    raise_warning("The runtime option Stats.EnableHotProfiler must be on to "
-                  "use xhprof.");
-    return;
-  }
-#ifdef CLOCK_THREAD_CPUTIME_ID
-  bool missingClockGetTimeNS =
-    Vdso::ClockGetTimeNS(CLOCK_THREAD_CPUTIME_ID) == -1;
-#else
-  bool missingClockGetTimeNS = true;
-#endif
-  if (missingClockGetTimeNS) {
-    // Both TrackVtsc and TrackCPU mean "do CPU time profiling".
-    //
-    // TrackVtsc means: require clock_gettime, or else no data.
-    // TrackCPU means: prefer clock_gettime, but fall back to getrusage.
-    flags &= ~TrackVtsc;
-  }
-  if (flags & TrackVtsc) {
-    flags |= TrackCPU;
-  }
-
-  if (flags & XhpTrace) {
-    s_profiler_factory->start(ProfilerKind::Trace, flags);
-  } else if (flags & Memo) {
-    flags = 0;  /* flags are not used by MemoProfiler::MemoProfiler */
-    s_profiler_factory->start(ProfilerKind::Memo, flags);
-  } else if (flags & External) {
-    for (ArrayIter iter(args); iter; ++iter) {
-      if (iter.first().toInt32() == 0) {
-         flags = iter.second().toInt32();
-      }
-    }
-    s_profiler_factory->start(ProfilerKind::External, flags);
-  } else {
-    s_profiler_factory->start(ProfilerKind::Hierarchical, flags);
-  }
-}
-
-Variant f_xhprof_disable() {
-  return s_profiler_factory->stop();
-}
-
-void f_xhprof_network_enable() {
-  ServerStats::StartNetworkProfile();
-}
-
-Variant f_xhprof_network_disable() {
-  return ServerStats::EndNetworkProfile();
-}
-
-void f_xhprof_sample_enable() {
-  if (RuntimeOption::EnableHotProfiler) {
-    s_profiler_factory->start(ProfilerKind::Sample, 0);
-  } else {
-    raise_warning("The runtime option Stats.EnableHotProfiler must be on to "
-                  "use xhprof.");
-  }
-}
-
-Variant f_xhprof_sample_disable() {
-  return s_profiler_factory->stop();
-}
-
-///////////////////////////////////////////////////////////////////////////////
-// constants
-const int64_t k_XHPROF_FLAGS_NO_BUILTINS = NoTrackBuiltins;
-const int64_t k_XHPROF_FLAGS_CPU = TrackCPU;
-const int64_t k_XHPROF_FLAGS_MEMORY = TrackMemory;
-const int64_t k_XHPROF_FLAGS_VTSC = TrackVtsc;
-const int64_t k_XHPROF_FLAGS_TRACE = XhpTrace;
-const int64_t k_XHPROF_FLAGS_MEASURE_XHPROF_DISABLE = MeasureXhprofDisable;
-const int64_t k_XHPROF_FLAGS_MALLOC = TrackMalloc;
-const int64_t k_XHPROF_FLAGS_I_HAVE_INFINITE_MEMORY = IHaveInfiniteMemory;
 
 ///////////////////////////////////////////////////////////////////////////////
 // injected code

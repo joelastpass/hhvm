@@ -23,18 +23,15 @@
 
 // Super temporary
 #ifndef USE_CMAKE
-#include "hphp/facebook/extensions/async_mysql/ext_async_mysql.h"
-#include "hphp/facebook/extensions/fbml/ext_fbml.h"
-#include "hphp/facebook/extensions/obc/ext_obc.h"
 #include "hphp/facebook/extensions/phpmc/ext_phpmc.h"
-#include "hphp/facebook/extensions/string_buffer/ext_string_buffer.h"
 #endif
 
 #include "hphp/runtime/ext/array/ext_array_idl.h"
+#include "hphp/runtime/ext/async_mysql/ext_async_mysql.h"
 #include "hphp/runtime/ext/ext_closure.h"
 #include "hphp/runtime/ext/ext_collections.h"
 #include "hphp/runtime/ext/ext_generator.h"
-#include "hphp/runtime/ext/ext_fb.h"
+#include "hphp/runtime/ext/fb/ext_fb.h"
 #include "hphp/runtime/ext/std/ext_std_file.h"
 #include "hphp/runtime/ext/ext_hash.h"
 #include "hphp/runtime/ext/ext_simplexml.h"

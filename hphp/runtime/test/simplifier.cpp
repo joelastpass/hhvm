@@ -67,7 +67,7 @@ TEST(Simplifier, CondJmp) {
 
   // Folding Conv*ToBool
   {
-    auto val = unit.gen(Conjure, marker, Type::Int);
+    auto val = unit.gen(Conjure, marker, TInt);
     auto cnv = unit.gen(ConvIntToBool, marker, val->dst());
     auto jcc = unit.gen(JmpZero, marker, unit.defBlock(), cnv->dst());
 
@@ -80,7 +80,7 @@ TEST(Simplifier, CondJmp) {
 
   // Folding in negation
   {
-    auto val = unit.gen(Conjure, marker, Type::Bool);
+    auto val = unit.gen(Conjure, marker, TBool);
     auto neg = unit.gen(XorBool, marker, val->dst(), unit.cns(true));
     auto jcc = unit.gen(JmpZero, marker, unit.defBlock(), neg->dst());
 
@@ -98,8 +98,8 @@ TEST(Simplifier, DoubleCmp) {
 
   // Lt(X:Dbl, Y:Int) --> LtDbl(X, ConvIntToDbl(Y))
   {
-    auto x = unit.gen(Conjure, dummy, Type::Dbl);
-    auto y = unit.gen(Conjure, dummy, Type::Int);
+    auto x = unit.gen(Conjure, dummy, TDbl);
+    auto y = unit.gen(Conjure, dummy, TInt);
     auto lt = unit.gen(Lt, dummy, x->dst(), y->dst());
     auto result = simplify(unit, lt, false);
 
@@ -111,7 +111,7 @@ TEST(Simplifier, DoubleCmp) {
 
   // Lt(X:Dbl, 10) --> LtDbl(X, 10.0)
   {
-    auto x  = unit.gen(Conjure, dummy, Type::Dbl);
+    auto x  = unit.gen(Conjure, dummy, TDbl);
     auto lt = unit.gen(Lt, dummy, x->dst(), unit.cns(10));
     auto result = simplify(unit, lt, false);
 
@@ -125,7 +125,7 @@ TEST(Simplifier, Count) {
 
   // Count($null) --> 0
   {
-    auto null = unit.gen(Conjure, dummy, Type::Null);
+    auto null = unit.gen(Conjure, dummy, TNull);
     auto count = unit.gen(Count, dummy, null->dst());
     auto result = simplify(unit, count, false);
 
@@ -136,7 +136,7 @@ TEST(Simplifier, Count) {
 
   // Count($bool_int_dbl_str) --> 1
   {
-    auto ty = Type::Bool | Type::Int | Type::Dbl | Type::Str | Type::Res;
+    auto ty = TBool | TInt | TDbl | TStr | TRes;
     auto val = unit.gen(Conjure, dummy, ty);
     auto count = unit.gen(Count, dummy, val->dst());
     auto result = simplify(unit, count, false);
@@ -148,7 +148,7 @@ TEST(Simplifier, Count) {
 
   // Count($array_no_kind) --> CountArray($array_no_kind)
   {
-    auto arr = unit.gen(Conjure, dummy, Type::Arr);
+    auto arr = unit.gen(Conjure, dummy, TArr);
     auto count = unit.gen(Count, dummy, arr->dst());
     auto result = simplify(unit, count, false);
 
@@ -159,7 +159,7 @@ TEST(Simplifier, Count) {
 
   // Count($array_packed) --> CountArrayFast($array_packed)
   {
-    auto ty = Type::Arr.specialize(ArrayData::kPackedKind);
+    auto ty = Type::Array(ArrayData::kPackedKind);
     auto arr = unit.gen(Conjure, dummy, ty);
     auto count = unit.gen(Count, dummy, arr->dst());
     auto result = simplify(unit, count, false);
@@ -171,7 +171,7 @@ TEST(Simplifier, Count) {
 
   // Count($some_obj) --> Count($some_obj)
   {
-    auto obj = unit.gen(Conjure, dummy, Type::Obj);
+    auto obj = unit.gen(Conjure, dummy, TObj);
     auto count = unit.gen(Count, dummy, obj->dst());
     auto result = simplify(unit, count, false);
     EXPECT_NO_CHANGE(result);
@@ -186,7 +186,7 @@ TEST(Simplifier, LdObjClass) {
 
   // LdObjClass t1:Obj<=C doesn't simplify
   {
-    auto sub = Type::Obj.specialize(cls);
+    auto sub = Type::SubObj(cls);
     auto obj = unit.gen(Conjure, dummy, sub);
     auto load = unit.gen(LdObjClass, dummy, obj->dst());
     auto result = simplify(unit, load, false);
@@ -195,7 +195,7 @@ TEST(Simplifier, LdObjClass) {
 
   // LdObjClass t1:Obj=C --> Cls(C)
   {
-    auto exact = Type::Obj.specializeExact(cls);
+    auto exact = Type::ExactObj(cls);
     auto obj = unit.gen(Conjure, dummy, exact);
     auto load = unit.gen(LdObjClass, dummy, obj->dst());
     auto result = simplify(unit, load, false);
@@ -211,7 +211,7 @@ TEST(Simplifier, LdObjInvoke) {
 
   // LdObjInvoke t1:Cls doesn't simplify
   {
-    auto type = Type::Cls;
+    auto type = TCls;
     auto cls = unit.gen(Conjure, dummy, type);
     auto load = unit.gen(LdObjInvoke, dummy, taken, cls->dst());
     auto result = simplify(unit, load, false);

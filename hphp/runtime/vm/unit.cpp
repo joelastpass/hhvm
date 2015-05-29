@@ -42,7 +42,6 @@
 #include "hphp/runtime/base/types.h"
 #include "hphp/runtime/base/attr.h"
 #include "hphp/runtime/base/autoload-handler.h"
-#include "hphp/runtime/base/class-info.h"
 #include "hphp/runtime/base/execution-context.h"
 #include "hphp/runtime/base/rds.h"
 #include "hphp/runtime/base/runtime-error.h"
@@ -63,6 +62,7 @@
 #include "hphp/runtime/vm/debugger-hook.h"
 #include "hphp/runtime/vm/func.h"
 #include "hphp/runtime/vm/func-inline.h"
+#include "hphp/runtime/vm/hh-utils.h"
 #include "hphp/runtime/vm/hhbc.h"
 #include "hphp/runtime/vm/instance-bits.h"
 #include "hphp/runtime/vm/named-entity.h"
@@ -402,8 +402,8 @@ bool Unit::getOffsetRange(Offset pc, OffsetRange& range) const {
   if (it != lineTable.end()) {
     assert(pc < it->pastOffset());
     Offset base = it == lineTable.begin() ? 0 : (it-1)->pastOffset();
-    range.m_base = base;
-    range.m_past = it->pastOffset();
+    range.base = base;
+    range.past = it->pastOffset();
     return true;
   }
   return false;
@@ -771,10 +771,9 @@ const Cell* Unit::lookupCns(const StringData* cnsName) {
       return &tv;
     }
     if (UNLIKELY(tv.m_data.pref != nullptr)) {
-      ClassInfo::ConstantInfo* ci =
-        (ClassInfo::ConstantInfo*)(void*)tv.m_data.pref;
-      auto const tvRet = const_cast<Variant&>(
-        ci->getDeferredValue()).asTypedValue();
+      auto callback =
+        reinterpret_cast<SystemConstantCallback>(tv.m_data.pref);
+      const Cell* tvRet = callback().asTypedValue();
       assert(cellIsPlausible(*tvRet));
       if (LIKELY(tvRet->m_type != KindOfUninit)) {
         return tvRet;
@@ -855,21 +854,22 @@ bool Unit::defCns(const StringData* cnsName, const TypedValue* value,
   return defCnsHelper(handle, value, cnsName);
 }
 
-void Unit::defDynamicSystemConstant(const StringData* cnsName,
-                                    const void* data) {
+bool Unit::defSystemConstantCallback(const StringData* cnsName,
+                                     SystemConstantCallback callback) {
   static const bool kServer = RuntimeOption::ServerExecutionMode();
   // Zend doesn't define the STD* streams in server mode so we don't either
   if (UNLIKELY(kServer &&
        (s_stdin.equal(cnsName) ||
         s_stdout.equal(cnsName) ||
         s_stderr.equal(cnsName)))) {
-    return;
+    return false;
   }
   auto const handle = makeCnsHandle(cnsName, true);
   assert(handle);
   TypedValue* cns = &rds::handleToRef<TypedValue>(handle);
   assert(cns->m_type == KindOfUninit);
-  cns->m_data.pref = (RefData*)data;
+  cns->m_data.pref = reinterpret_cast<RefData*>(callback);
+  return true;
 }
 
 
@@ -880,22 +880,18 @@ namespace {
 
 TypeAliasReq typeAliasFromClass(const TypeAlias* thisType, Class *klass) {
   TypeAliasReq req;
-
+  req.name = thisType->name;
+  req.nullable = thisType->nullable;
   if (isEnum(klass)) {
     // If the class is an enum, pull out the actual base type.
     if (auto const enumType = klass->enumBaseTy()) {
-      req.kind     = *enumType;
-      req.nullable = thisType->nullable;
-      req.name     = thisType->name;
+      req.type = dataTypeToAnnotType(*enumType);
     } else {
-      req.any  = true;
-      req.name = thisType->name;
+      req.type = AnnotType::Mixed;
     }
   } else {
-    req.kind     = KindOfObject;
-    req.nullable = thisType->nullable;
-    req.klass    = klass;
-    req.name     = thisType->name;
+    req.type = AnnotType::Object;
+    req.klass = klass;
   }
   return req;
 }
@@ -912,8 +908,9 @@ TypeAliasReq resolveTypeAlias(const TypeAlias* thisType) {
    * If the right hand side was a class, we need to autoload and
    * ensure it exists at this point.
    */
-
-  if (thisType->kind != KindOfObject) {
+  if (thisType->type != AnnotType::Object &&
+      thisType->type != AnnotType::Self &&
+      thisType->type != AnnotType::Parent) {
     return TypeAliasReq::From(*thisType);
   }
 
@@ -1320,6 +1317,8 @@ template <bool debugger>
 void Unit::mergeImpl(void* tcbase, MergeInfo* mi) {
   assert(m_mergeState & MergeState::Merged);
 
+  autoTypecheck(this);
+
   Func** it = mi->funcHoistableBegin();
   Func** fend = mi->funcEnd();
   if (it != fend) {
@@ -1511,7 +1510,7 @@ void Unit::mergeImpl(void* tcbase, MergeInfo* mi) {
             if (!fp) {
               ve = g_context->m_globalVarEnv;
             } else {
-              if (fp->hasVarEnv()) {
+              if ((fp->func()->attrs() & AttrMayUseVV) && fp->hasVarEnv()) {
                 ve = fp->m_varEnv;
               } else {
                 // Nothing to do. If there is no varEnv, the enclosing

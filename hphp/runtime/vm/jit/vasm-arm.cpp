@@ -68,7 +68,7 @@ vixl::FPRegister D(Vreg r) {
 
 // convert Vptr to MemOperand
 vixl::MemOperand M(Vptr p) {
-  assert(p.base.isValid() && !p.index.isValid());
+  assertx(p.base.isValid() && !p.index.isValid());
   return X(p.base)[p.disp];
 }
 
@@ -107,7 +107,9 @@ private:
   void emit(hcunwind& i);
   void emit(hostcall& i);
   void emit(ldimmq& i);
+  void emit(ldimml& i);
   void emit(ldimmb& i);
+  void emit(ldimmqs& i) { not_implemented(); }
   void emit(load& i);
   void emit(store& i);
   void emit(syncpoint& i);
@@ -126,6 +128,7 @@ private:
   void emit(cmpli& i) { a->Cmp(W(i.s1), i.s0.l()); }
   void emit(cmpq& i) { a->Cmp(X(i.s1), X(i.s0)); }
   void emit(cmpqi& i) { a->Cmp(X(i.s1), i.s0.l()); }
+  void emit(cmpqims& i) { not_implemented(); }
   void emit(decq& i) { a->Sub(X(i.d), X(i.s), 1LL, vixl::SetFlags); }
   void emit(incq& i) { a->Add(X(i.d), X(i.s), 1LL, vixl::SetFlags); }
   void emit(jcc& i);
@@ -165,7 +168,7 @@ private:
 
 private:
   Vasm::Area& area(AreaIndex i) {
-    assert((unsigned)i < areas.size());
+    assertx((unsigned)i < areas.size());
     return areas[(unsigned)i];
   }
 
@@ -214,7 +217,7 @@ void Vgen::emit(jit::vector<Vlabel>& labels) {
   }
 
   for (int i = 0, n = labels.size(); i < n; ++i) {
-    assert(checkBlockEnd(unit, labels[i]));
+    assertx(checkBlockEnd(unit, labels[i]));
 
     auto b = labels[i];
     auto& block = unit.blocks[b];
@@ -284,16 +287,16 @@ void Vgen::emit(jit::vector<Vlabel>& labels) {
   }
 
   for (auto& p : jccs) {
-    assert(addrs[p.target]);
+    assertx(addrs[p.target]);
     backend.smashJcc(p.instr, addrs[p.target]);
   }
   for (auto& p : bccs) {
-    assert(addrs[p.target]);
+    assertx(addrs[p.target]);
     auto link = (Instruction*) p.instr;
     link->SetImmPCOffsetTarget(Instruction::Cast(addrs[p.target]));
   }
   for (auto& p : jmps) {
-    assert(addrs[p.target]);
+    assertx(addrs[p.target]);
     backend.smashJmp(p.instr, addrs[p.target]);
   }
   for (auto& p : catches) {
@@ -336,12 +339,12 @@ void Vgen::emit(bindcall& i) {
 }
 
 void Vgen::emit(bindjcc& i) {
-  emitBindJcc(*codeBlock, frozen(), i.cc, i.target);
+  emitBindJ(*codeBlock, frozen(), i.cc, i.target);
 }
 
 void Vgen::emit(bindjmp& i) {
   // XXX what about trflags
-  emitBindJmp(*codeBlock, frozen(), i.target);
+  emitBindJ(*codeBlock, frozen(), CC_None, i.target);
 }
 
 void Vgen::emit(copy& i) {
@@ -352,7 +355,7 @@ void Vgen::emit(copy& i) {
   } else if (i.s.isGP() && i.d.isSIMD()) {
     a->Fmov(D(i.d), X(i.s));
   } else {
-    assert(i.s.isSIMD() && i.d.isSIMD());
+    assertx(i.s.isSIMD() && i.d.isSIMD());
     a->Fmov(D(i.d), D(i.s));
   }
 }
@@ -382,11 +385,11 @@ void Vgen::emit(fallbackcc i) {
 }
 
 void Vgen::emit(fallback& i) {
-  emit(fallbackcc{CC_None, InvalidReg, i.dest, i.trflags});
+  emit(fallbackcc{CC_None, InvalidReg, i.dest, i.trflags, i.args});
 }
 
 void Vgen::emit(hcsync& i) {
-  assert(points[i.call]);
+  assertx(points[i.call]);
   mcg->recordSyncPoint(points[i.call], i.fix.pcOffset, i.fix.spOffset);
 }
 
@@ -428,9 +431,31 @@ void Vgen::emit(ldimmq& i) {
   }
 }
 
+static void emitSimdImmInt(vixl::MacroAssembler* a, int64_t val, Vreg d) {
+  if (val == 0) {
+    a->Fmov(D(d), vixl::xzr);
+  } else {
+    a->Mov(rAsm, val); // XXX avoid scratch register somehow.
+    a->Fmov(D(d), rAsm);
+  }
+}
+
+void Vgen::emit(ldimml& i) {
+  if (i.d.isSIMD()) {
+    emitSimdImmInt(a, i.s.q(), i.d);
+  } else {
+    Vreg32 d = i.d;
+    a->Mov(W(d), i.s.l());
+  }
+}
+
 void Vgen::emit(ldimmb& i) {
-  assert_not_implemented(i.d.isGP());
-  a->Mov(W(i.d), i.s.b());
+  if (i.d.isSIMD()) {
+    emitSimdImmInt(a, i.s.q(), i.d);
+  } else {
+    Vreg8 d = i.d;
+    a->Mov(W(d), i.s.b());
+  }
 }
 
 void Vgen::emit(load& i) {
@@ -464,7 +489,7 @@ void Vgen::emit(jmp i) {
 }
 
 void Vgen::emit(jcc& i) {
-  assert(i.cc != CC_None);
+  assertx(i.cc != CC_None);
   if (i.targets[1] != i.targets[0]) {
     if (next == i.targets[1]) {
       // the taken branch is the fall-through block, invert the branch.
@@ -478,7 +503,7 @@ void Vgen::emit(jcc& i) {
 }
 
 void Vgen::emit(cbcc& i) {
-  assert(i.cc == vixl::ne || i.cc == vixl::eq);
+  assertx(i.cc == vixl::ne || i.cc == vixl::eq);
   if (i.targets[1] != i.targets[0]) {
     if (next == i.targets[1]) {
       // the taken branch is the fall-through block, invert the branch.
@@ -497,7 +522,7 @@ void Vgen::emit(cbcc& i) {
 }
 
 void Vgen::emit(tbcc& i) {
-  assert(i.cc == vixl::ne || i.cc == vixl::eq);
+  assertx(i.cc == vixl::ne || i.cc == vixl::eq);
   if (i.targets[1] != i.targets[0]) {
     if (next == i.targets[1]) {
       // the taken branch is the fall-through block, invert the branch.
@@ -521,7 +546,7 @@ void Vgen::emit(tbcc& i) {
 void lower_svcreq(Vunit& unit, Vlabel b, Vinstr& inst) {
   auto svcreq = inst.svcreq_; // copy it
   auto origin = inst.origin;
-  auto& argv = unit.tuples[svcreq.args];
+  auto& argv = unit.tuples[svcreq.extraArgs];
   unit.blocks[b].code.pop_back(); // delete the svcreq instruction
   Vout v(unit, b, origin);
 
@@ -532,7 +557,7 @@ void lower_svcreq(Vunit& unit, Vlabel b, Vinstr& inst) {
     arg_dests.push_back(d);
     arg_regs |= d;
   }
-  v << copyargs{svcreq.args, v.makeTuple(arg_dests)};
+  v << copyargs{svcreq.extraArgs, v.makeTuple(arg_dests)};
   // Save VM regs
   PhysReg vmfp{rVmFp}, vmsp{rVmSp}, sp{vixl::sp}, rdsp{rVmTl};
   v << store{vmfp, rdsp[rds::kVmfpOff]};
@@ -616,7 +641,7 @@ void lower(testbim& i, Vout& v) {
 }
 
 void lowerForARM(Vunit& unit) {
-  assert(check(unit));
+  assertx(check(unit));
 
   // block order doesn't matter, but only visit reachable blocks.
   auto blocks = sortBlocks(unit);
@@ -640,33 +665,34 @@ void lowerForARM(Vunit& unit) {
     }
   }
 
-  assert(check(unit));
+  assertx(check(unit));
   printUnit(kVasmARMFoldLevel, "after lowerForARM", unit);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
 }
 
-void Vasm::finishARM(const Abi& abi, AsmInfo* asmInfo) {
-  optimizeExits(m_unit);
-  lower(m_unit);
-  if (!m_unit.constants.empty()) {
-    foldImms<arm::ImmFolder>(m_unit);
+void finishARM(Vunit& unit, Vasm::AreaList& areas,
+               const Abi& abi, AsmInfo* asmInfo) {
+  optimizeExits(unit);
+  lower(unit);
+  if (!unit.constants.empty()) {
+    foldImms<arm::ImmFolder>(unit);
   }
-  lowerForARM(m_unit);
-  if (m_unit.needsRegAlloc()) {
+  lowerForARM(unit);
+  if (unit.needsRegAlloc()) {
     Timer _t(Timer::vasm_xls);
-    removeDeadCode(m_unit);
-    allocateRegisters(m_unit, abi);
+    removeDeadCode(unit);
+    allocateRegisters(unit, abi);
   }
-  if (m_unit.blocks.size() > 1) {
+  if (unit.blocks.size() > 1) {
     Timer _t(Timer::vasm_jumps);
-    optimizeJmps(m_unit);
+    optimizeJmps(unit);
   }
 
   Timer _t(Timer::vasm_gen);
-  auto blocks = layoutBlocks(m_unit);
-  Vgen(m_unit, m_areas, asmInfo).emit(blocks);
+  auto blocks = layoutBlocks(unit);
+  Vgen(unit, areas, asmInfo).emit(blocks);
 }
 
 ///////////////////////////////////////////////////////////////////////////////

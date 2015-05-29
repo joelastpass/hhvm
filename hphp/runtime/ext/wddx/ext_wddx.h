@@ -18,7 +18,7 @@
 #ifndef incl_HPHP_EXT_WDDX_H_
 #define incl_HPHP_EXT_WDDX_H_
 
-#include "hphp/runtime/base/base-includes.h"
+#include "hphp/runtime/ext/extension.h"
 #include "hphp/runtime/base/string-buffer.h"
 
 namespace HPHP {
@@ -60,7 +60,8 @@ class WddxPacket: public ResourceData {
 ///////////////////////////////////////////////////////////////////////////////
 // helper
 
-void find_var_recursive(const TypedValue* tv, WddxPacket* wddxPacket);
+void find_var_recursive(const TypedValue* tv,
+                        const SmartPtr<WddxPacket>& wddxPacket);
 
 }
 

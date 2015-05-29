@@ -18,7 +18,7 @@
 #include "hphp/runtime/ext/stream/ext_stream-user-filters.h"
 #include "hphp/runtime/ext/stream/ext_stream.h"
 #include "hphp/runtime/base/array-init.h"
-#include "hphp/runtime/base/base-includes.h"
+#include "hphp/runtime/ext/extension.h"
 #include "hphp/runtime/base/builtin-functions.h"
 #include "hphp/runtime/base/file.h"
 #include "hphp/runtime/ext/array/ext_array.h"
@@ -41,10 +41,58 @@ const StaticString s_bucket_class("__SystemLib\\StreamFilterBucket");
 const StaticString s_default_filters_register_func(
   "__SystemLib\\register_default_stream_filters");
 
-class StreamUserFilters : public RequestEventHandler {
- public:
+///////////////////////////////////////////////////////////////////////////////
+
+class StreamFilterRepository {
+public:
+  void add(const String& key, const Variant& v) {
+    m_filters.add(key, v);
+  }
+
+  void detach() {
+    m_filters.detach();
+  }
+
+  bool exists(const String& needle) const {
+    if (m_filters.exists(needle.toKey())) {
+      return true;
+    }
+    /* Could not find exact match, now try wildcard match */
+    int lastDotPos = needle.rfind('.');
+    if (String::npos == lastDotPos) {
+      return false;
+    }
+    String wildcard = needle.substr(0, lastDotPos) + ".*";
+    return m_filters.exists(wildcard.toKey());
+  }
+
+  Variant rvalAt(const String& needle) const {
+    /* First try to find exact match, afterwards try wildcard matches */
+    int lastDotPos = needle.rfind('.');
+    if (String::npos == lastDotPos || m_filters.exists(needle.toKey())) {
+      return m_filters.rvalAtRef(needle);
+    }
+    String wildcard = needle.substr(0, lastDotPos) + ".*";
+    return m_filters.rvalAtRef(wildcard);
+  }
+
+  const Array& filtersAsArray() const {
+    return m_filters;
+  }
+
+  bool isNull() const {
+    return m_filters.isNull();
+  }
+
+private:
+  Array m_filters;
+};
+
+///////////////////////////////////////////////////////////////////////////////
+
+struct StreamUserFilters final : RequestEventHandler {
   virtual ~StreamUserFilters() {}
-  Array m_registeredFilters;
+  StreamFilterRepository m_registeredFilters;
 
   bool registerFilter(const String& name, const String& class_name) {
     if (m_registeredFilters.exists(name)) {
@@ -76,13 +124,18 @@ class StreamUserFilters : public RequestEventHandler {
                                  /* append = */ true);
   }
 
-  virtual void requestInit() {
+  void requestInit() override {
     vm_call_user_func(s_default_filters_register_func, empty_array_ref);
   }
 
-  virtual void requestShutdown() {
+  void requestShutdown() override {
     m_registeredFilters.detach();
   }
+
+  void vscan(IMarker& mark) const override {
+    mark(m_registeredFilters.filtersAsArray());
+  }
+
 private:
   Variant appendOrPrependFilter(const Resource& stream,
                  const String& filtername,
@@ -99,9 +152,7 @@ private:
       return false;
     }
 
-    auto file = stream.getTyped<File>();
-    assert(file);
-
+    auto file = cast<File>(stream);
     int mode = readwrite.toInt32();
     if (!mode) {
       auto str = file->getMode();
@@ -126,7 +177,7 @@ private:
     SmartPtr<StreamFilter> ret;
     if (mode & k_STREAM_FILTER_READ) {
       auto resource = createInstance(func_name,
-                                     stream,
+                                     file,
                                      filtername,
                                      params);
       if (!resource) {
@@ -141,7 +192,7 @@ private:
     }
     if (mode & k_STREAM_FILTER_WRITE) {
       auto resource = createInstance(func_name,
-                                     stream,
+                                     file,
                                      filtername,
                                      params);
       if (!resource) {
@@ -158,7 +209,7 @@ private:
   }
 
   SmartPtr<StreamFilter> createInstance(const char* php_func,
-                                        const Resource& stream,
+                                        SmartPtr<File> stream,
                                         const String& filter,
                                         const Variant& params) {
     auto class_name = m_registeredFilters.rvalAt(filter).asCStrRef();
@@ -167,7 +218,7 @@ private:
 
     if (LIKELY(class_ != nullptr)) {
       PackedArrayInit ctor_args(3);
-      ctor_args.append(stream);
+      ctor_args.append(Variant(stream));
       ctor_args.append(filter);
       ctor_args.append(params);
       obj = g_context->createObject(class_name.get(), ctor_args.toArray());
@@ -222,12 +273,10 @@ void StreamFilter::invokeOnClose() {
 }
 
 bool StreamFilter::remove() {
-  if (m_stream.isNull()) {
+  if (!m_stream) {
     return false;
   }
-  auto file = m_stream.getTyped<File>();
-  assert(file);
-  auto ret = file->removeFilter(SmartPtr<StreamFilter>(this));
+  auto ret = m_stream->removeFilter(SmartPtr<StreamFilter>(this));
   m_stream.reset();
   return ret;
 }
@@ -281,7 +330,7 @@ Array HHVM_FUNCTION(stream_get_filters) {
   if (UNLIKELY(filters.isNull())) {
     return empty_array();
   }
-  return array_keys_helper(filters).toArray();
+  return array_keys_helper(filters.filtersAsArray()).toArray();
 }
 
 Variant HHVM_FUNCTION(stream_filter_append,
@@ -307,28 +356,19 @@ Variant HHVM_FUNCTION(stream_filter_prepend,
 }
 
 bool HHVM_FUNCTION(stream_filter_remove, const Resource& resource) {
-  auto filter = resource.getTyped<StreamFilter>();
-  assert(filter);
-  return filter->remove();
+  return cast<StreamFilter>(resource)->remove();
 }
 
 Variant HHVM_FUNCTION(stream_bucket_make_writeable, const Resource& bb_res) {
-  auto brigade = bb_res.getTyped<BucketBrigade>();
-  assert(brigade);
-  auto ret = brigade->popFront();
-  return ret;
+  return cast<BucketBrigade>(bb_res)->popFront();
 }
 
 void HHVM_FUNCTION(stream_bucket_append, const Resource& bb_res, const Object& bucket) {
-  auto brigade = bb_res.getTyped<BucketBrigade>();
-  assert(brigade);
-  brigade->appendBucket(bucket);
+  cast<BucketBrigade>(bb_res)->appendBucket(bucket);
 }
 
 void HHVM_FUNCTION(stream_bucket_prepend, const Resource& bb_res, const Object& bucket) {
-  auto brigade = bb_res.getTyped<BucketBrigade>();
-  assert(brigade);
-  brigade->prependBucket(bucket);
+  cast<BucketBrigade>(bb_res)->prependBucket(bucket);
 }
 
 const StaticString

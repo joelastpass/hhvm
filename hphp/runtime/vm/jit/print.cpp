@@ -313,7 +313,7 @@ void print(std::ostream& os, const Block* block, AreaIndex area,
       // There can be asm ranges in areas other than the one this blocks claims
       // to be in so we have to iterate all the areas to be sure to get
       // everything.
-      for (auto i = 0; i < static_cast<int>(AreaIndex::Max); ++i) {
+      for (auto i = 0; i < kNumAreas; ++i) {
         AreaIndex currentArea = static_cast<AreaIndex>(i);
         TcaRange instRange = asmInfo->instRangesForArea(currentArea)[inst];
         if (!instRange.empty()) {
@@ -322,9 +322,16 @@ void print(std::ostream& os, const Block* block, AreaIndex area,
           disasmRange(os, instRange.begin(), instRange.end());
           os << '\n';
           if (currentArea == area) {
-            assert(instRange.end() >= blockRange.start());
-            assert(instRange.end() <= blockRange.end());
-            blockRange = TcaRange(instRange.end(), blockRange.end());
+            // FIXME: this used to be an assertion
+            auto things_are_ok =
+              instRange.end() >= blockRange.start() &&
+              instRange.end() <= blockRange.end();
+            if (things_are_ok) {
+              blockRange = TcaRange(instRange.end(), blockRange.end());
+            } else {
+              // Don't crash; do something broken instead.
+              os << "<note: print range is probably incorrect right now>\n";
+            }
           }
         }
       }
@@ -406,7 +413,7 @@ void print(std::ostream& os, const IRUnit& unit, const AsmInfo* asmInfo,
 
   // Print the block CFG above the actual code.
 
-  auto const backedges = findBackEdges(unit);
+  auto const retreating_edges = findRetreatingEdges(unit);
   os << "digraph G {\n";
   for (auto block : blocks) {
     if (block->empty()) continue;
@@ -436,7 +443,7 @@ void print(std::ostream& os, const IRUnit& unit, const AsmInfo* asmInfo,
       return
         target->isCatch() ? " [color=blue]" :
         target->isExit() ? " [color=cyan]" :
-        backedges.count(edge) ? " [color=red]" :
+        retreating_edges.count(edge) ? " [color=red]" :
         target->hint() == Block::Hint::Unlikely ? " [color=green]" : "";
     };
     auto show_edge = [&] (Edge* edge) {
@@ -476,9 +483,9 @@ void print(const IRUnit& unit) {
   std::cerr << std::endl;
 }
 
-std::string IRUnit::toString() const {
+std::string show(const IRUnit& unit) {
   std::ostringstream out;
-  print(out, *this);
+  print(out, unit);
   return out.str();
 }
 

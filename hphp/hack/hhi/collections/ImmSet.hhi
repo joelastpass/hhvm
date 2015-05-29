@@ -15,12 +15,12 @@
  * YOU SHOULD NEVER INCLUDE THIS FILE ANYWHERE!!!
  */
 
-final class ImmSet<Tv> implements ConstSet<Tv> {
+final class ImmSet<+Tv> implements ConstSet<Tv> {
   /**
-   * Create an empty ImmSet (if no parameters are passed) or create
-   * an ImmSet from an Traversable (if one parameter is passed).
+   * Creates an ImmSet from the given Traversable, or an empty ImmSet
+   * if "null" is passed.
    */
-  public function __construct(?Traversable<Tv> $it = null);
+  public function __construct(?Traversable<Tv> $it);
 
   /**
    * Returns true if the ImmSet is empty, false otherwise.
@@ -36,7 +36,7 @@ final class ImmSet<Tv> implements ConstSet<Tv> {
    * Returns true if the specified value is present in the ImmSet, returns
    * false otherwise.
    */
-  public function contains(Tv $k): bool;
+  public function contains<Tu super Tv>(Tu $k): bool;
 
   /**
    * Returns an array containing the values from this ImmSet.
@@ -46,17 +46,17 @@ final class ImmSet<Tv> implements ConstSet<Tv> {
   /**
    * Returns an array containing the values from this ImmSet.
    */
-  public function toValuesArray(): array;
+  public function toKeysArray(): array;
+
+  /**
+   * Returns an array containing the values from this ImmSet.
+   */
+  public function toValuesArray(): array<Tv>;
 
   /**
    * Returns an iterator that points to the beginning of this ImmSet.
    */
   public function getIterator(): SetIterator<Tv>;
-
-  /**
-   * Returns an ImmSet containing the values from the specified array.
-   */
-  public static function fromArray(array $arr): ImmSet<Tv>;
 
   public static function fromItems(?Traversable<Tv> $items): ImmSet<Tv>;
 
@@ -74,6 +74,9 @@ final class ImmSet<Tv> implements ConstSet<Tv> {
   /**
    * Returns a Vector containing the elements of this ImmSet.
    */
+  /* HH_FIXME[4120]: While this violates our variance annotations, we are
+   * returning a copy of the underlying collection, so it is actually safe
+   * See #6853603. */
   public function toVector(): Vector<Tv>;
 
   /**
@@ -84,6 +87,9 @@ final class ImmSet<Tv> implements ConstSet<Tv> {
   /**
    * Returns a Map containing the elements of this ImmSet.
    */
+  /* HH_FIXME[4120]: While this violates our variance annotations, we are
+   * returning a copy of the underlying collection, so it is actually safe
+   * See #6853603. */
   public function toMap(): Map<mixed, Tv>;
 
   /**
@@ -94,6 +100,9 @@ final class ImmSet<Tv> implements ConstSet<Tv> {
   /**
    * Returns a Set containing the elements of this ImmSet.
    */
+  /* HH_FIXME[4120]: While this violates our variance annotations, we are
+   * returning a copy of the underlying collection, so it is actually safe
+   * See #6853603. */
   public function toSet(): Set<Tv>;
 
   /**
@@ -105,7 +114,7 @@ final class ImmSet<Tv> implements ConstSet<Tv> {
   public function items(): Iterable<Tv>;
   public function values(): ImmVector<Tv>;
   public function keys(): ImmVector<mixed>;
-  public function lazy(): Iterable<Tv>;
+  public function lazy(): KeyedIterable<mixed, Tv>;
   public function map<Tu>((function(Tv): Tu) $callback): ImmSet<Tu>;
   public function mapWithKey<Tu>((function(mixed, Tv): Tu) $callback): ImmSet<Tu>;
   public function filter((function(Tv): bool) $callback): ImmSet<Tv>;
@@ -116,7 +125,9 @@ final class ImmSet<Tv> implements ConstSet<Tv> {
   public function skip(int $n): ImmSet<Tv>;
   public function skipWhile((function(Tv): bool) $fn): ImmSet<Tv>;
   public function slice(int $start, int $len): ImmSet<Tv>;
-  public function concat(Traversable<Tv> $traversable): ImmVector<Tv>;
+  public function concat<Tu super Tv>(
+    Traversable<Tu> $traversable
+  ): ImmVector<Tu>;
   public function firstValue(): ?Tv;
   public function firstKey(): mixed;
   public function lastValue(): ?Tv;

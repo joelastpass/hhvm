@@ -50,8 +50,8 @@
 
 final class Map<Tk, Tv> implements MutableMap<Tk, Tv> {
   /**
-   * Create an empty Map (if no parameters are passed) or create
-   * a Map from an KeyedTraversable (if one parameter is passed).
+   * Creates a Map from the given KeyedTraversable, or an empty Map
+   * if "null" is passed.
    */
   public function __construct(?KeyedTraversable<Tk, Tv> $it);
 
@@ -80,6 +80,7 @@ final class Map<Tk, Tv> implements MutableMap<Tk, Tv> {
   public function lazy(): KeyedIterable<Tk, Tv>;
   public function values(): Vector<Tv>;
   public function keys(): Vector<Tk>;
+  /* HH_FIXME[3007]: This is intentional; not a constructor */
   public function map<Tu>((function(Tv): Tu) $callback): Map<Tk, Tu>;
   public function mapWithKey<Tu>((function(Tk, Tv): Tu) $callback): Map<Tk, Tu>;
   public function filter((function(Tv): bool) $callback): Map<Tk, Tv>;
@@ -91,7 +92,7 @@ final class Map<Tk, Tv> implements MutableMap<Tk, Tv> {
   public function skip(int $n): Map<Tk, Tv>;
   public function skipWhile((function(Tv): bool) $fn): Map<Tk, Tv>;
   public function slice(int $start, int $len): Map<Tk, Tv>;
-  public function concat(Traversable<Tv> $traversable): Vector<Tv>;
+  public function concat<Tu super Tv>(Traversable<Tu> $traversable): Vector<Tu>;
   public function firstValue(): ?Tv;
   public function firstKey(): ?Tk;
   public function lastValue(): ?Tv;
@@ -138,8 +139,8 @@ final class Map<Tk, Tv> implements MutableMap<Tk, Tv> {
   /**
    * Returns true if the specified key is present in the Map, false otherwise.
    */
-  public function contains(Tk $k): bool;
-  public function containsKey(Tk $k): bool;
+  public function contains<Tu super Tk>(Tu $k): bool;
+  public function containsKey<Tu super Tk>(Tu $k): bool;
 
   /**
    * Add a key/value Pair to this Map. "$mp->add($p)" is semantically
@@ -175,7 +176,8 @@ final class Map<Tk, Tv> implements MutableMap<Tk, Tv> {
   /**
    * Returns a Map containing the key/value pairs from the specified array.
    */
-  public static function fromArray(array $arr): Map<Tk, Tv>;
+  <<__Deprecated('Use `new Map()` instead.')>>
+  public static function fromArray(array<Tk, Tv> $arr): Map<Tk, Tv>;
 
   public static function fromItems(?Traversable<Pair<Tk, Tv>> $items)
     : Map<Tk, Tv>;
@@ -185,7 +187,7 @@ final class Map<Tk, Tv> implements MutableMap<Tk, Tv> {
   public function items(): Iterable<Pair<Tk, Tv>>;
 }
 
-class MapIterator<Tk, Tv> implements KeyedIterator<Tk, Tv> {
+class MapIterator<Tk, +Tv> implements KeyedIterator<Tk, Tv> {
   public function __construct();
   public function current(): Tv;
   public function key(): Tk;

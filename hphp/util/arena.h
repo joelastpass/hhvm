@@ -21,7 +21,6 @@
 #include <cstring>
 
 #include "hphp/util/pointer-list.h"
-#include "hphp/runtime/base/runtime-option.h"
 
 namespace HPHP {
 
@@ -37,9 +36,8 @@ namespace HPHP {
  * the current allocator state, which you can pop back to by calling
  * endFrame.
  *
- * Allocations smaller than kMinBytes bytes are rounded up to
- * kMinBytes, and all allocations are kMinBytes-aligned.  This mirrors
- * the way stack alignment works in gcc, which should be good enough.
+ * Allocations smaller than kMinBytes bytes are rounded up to kMinBytes, and
+ * all allocations are kMinBytes-aligned.
  *
  * Allocations larger than kChunkBytes are acquired directly from
  * malloc, and don't (currently) get freed with frames.
@@ -54,7 +52,7 @@ typedef ArenaImpl<4096> Arena;
 
 template<size_t kChunkBytes>
 class ArenaImpl {
-  static const size_t kMinBytes = 16;
+  static const size_t kMinBytes = 8;
 
  public:
   ArenaImpl();
@@ -148,6 +146,8 @@ inline void ArenaImpl<kChunkBytes>::endFrame() {
   m_frame = *m_frame.prev;
   m_current = m_ptrs[m_frame.index];
 }
+
+void SetArenaSlabAllocBypass(bool f);
 
 //////////////////////////////////////////////////////////////////////
 

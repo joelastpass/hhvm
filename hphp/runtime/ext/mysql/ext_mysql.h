@@ -20,7 +20,7 @@
 
 #include <folly/Optional.h>
 
-#include "hphp/runtime/base/base-includes.h"
+#include "hphp/runtime/ext/extension.h"
 #include "mysql.h"
 #include "hphp/runtime/base/smart-containers.h"
 #include "hphp/runtime/base/config.h"
@@ -37,6 +37,17 @@ namespace HPHP {
 Variant HHVM_FUNCTION(mysql_num_fields, const Resource& result);
 Variant HHVM_FUNCTION(mysql_fetch_lengths, const Resource& result);
 Variant HHVM_FUNCTION(mysql_num_rows, const Resource& result);
+String HHVM_FUNCTION(mysql_get_client_info);
+Variant HHVM_FUNCTION(mysql_affected_rows, const Variant& link_identifier);
+Variant HHVM_FUNCTION(mysql_error, const Variant& link_identifier);
+Variant HHVM_FUNCTION(mysql_errno, const Variant& link_identifier);
+Variant HHVM_FUNCTION(mysql_get_host_info, const Variant& link_identifier);
+Variant HHVM_FUNCTION(mysql_info, const Variant& link_identifier);
+Variant HHVM_FUNCTION(mysql_insert_id, const Variant& link_identifier);
+Variant HHVM_FUNCTION(mysql_get_proto_info, const Variant& link_identifier);
+Variant HHVM_FUNCTION(mysql_get_server_info, const Variant& link_identifier);
+Variant HHVM_FUNCTION(mysql_thread_id, const Variant& link_identifier);
+Variant HHVM_FUNCTION(mysql_warning_count, const Variant& link_identifier);
 
 class mysqlExtension final : public Extension {
 public:

@@ -25,7 +25,9 @@
 #include "hphp/runtime/base/file-util.h"
 #include "hphp/runtime/base/http-client.h"
 #include "hphp/runtime/base/ini-setting.h"
+#include "hphp/runtime/base/actrec-args.h"
 #include "hphp/runtime/base/pipe.h"
+#include "hphp/runtime/base/plain-file.h"
 #include "hphp/runtime/base/request-local.h"
 #include "hphp/runtime/base/runtime-error.h"
 #include "hphp/runtime/base/runtime-option.h"
@@ -69,7 +71,7 @@
                                                value.get())                    \
 
 #define CHECK_HANDLE_BASE(handle, f, ret)               \
-  File *f = handle.getTyped<File>(true, true);          \
+  auto f = dyn_cast_or_null<File>(handle);              \
   if (f == nullptr || f->isClosed()) {                  \
     raise_warning("Not a valid stream resource");       \
     return (ret);                                       \
@@ -601,7 +603,7 @@ Variant HHVM_FUNCTION(file_put_contents,
 
   if (flags & LOCK_EX) {
     // Check to make sure we are dealing with a regular file
-    if (!dynamic_cast<PlainFile*>(file.get())) {
+    if (!isa<PlainFile>(file)) {
       raise_warning(
         "%s(): Exclusive locks may only be set for regular files",
         __FUNCTION__ + 2);
@@ -617,7 +619,7 @@ Variant HHVM_FUNCTION(file_put_contents,
 
   switch (data.getType()) {
     case KindOfResource: {
-      File *fsrc = data.toResource().getTyped<File>(true, true);
+      auto fsrc = dyn_cast_or_null<File>(data);
       if (!fsrc) {
         raise_warning("Not a valid stream resource");
         return false;
@@ -813,12 +815,11 @@ static String resolve_parse_ini_filename(const String& filename) {
   }
 
   // Next, see if include path was set in the ini settings.
-  auto const includePaths = ThreadInfo::s_threadInfo.getNoCheck()->
-    m_reqInjectionData.getIncludePaths();
+  auto const& includePaths =
+    ThreadInfo::s_threadInfo->m_reqInjectionData.getIncludePaths();
 
-  unsigned int pathCount = includePaths.size();
-  for (int i = 0; i < (int)pathCount; i++) {
-    resolved = includePaths[i] + '/' + filename;
+  for (auto const& path : includePaths) {
+    resolved = path + '/' + filename;
     if (HHVM_FN(file_exists)(resolved)) {
       return resolved;
     }
@@ -1071,9 +1072,38 @@ bool HHVM_FUNCTION(is_executable,
   */
 }
 
+static VFileType lookupVirtualFile(const String& filename) {
+  if (filename.empty() || !StaticContentCache::TheFileCache) {
+    return VFileType::NotFound;
+  }
+
+  String cwd;
+  std::string root;
+  bool isRelative = (filename.charAt(0) != '/');
+  if (isRelative) {
+    cwd = g_context->getCwd();
+    root = RuntimeOption::SourceRoot;
+    if (cwd.empty() || cwd[cwd.size() - 1] != '/') root.pop_back();
+  }
+
+  if (!isRelative || !root.compare(cwd.data())) {
+    return StaticContentCache::TheFileCache->getFileType(filename.data());
+  }
+
+  return VFileType::NotFound;
+}
+
 bool HHVM_FUNCTION(is_file,
                    const String& filename) {
   CHECK_PATH_FALSE(filename, 1);
+  if (filename.empty()) {
+    return false;
+  }
+  auto vtype = lookupVirtualFile(filename);
+  if (vtype != VFileType::NotFound) {
+    return vtype == VFileType::PlainFile;
+  }
+
   struct stat sb;
   CHECK_SYSTEM_SILENT(statSyscall(filename, &sb, true));
   return (sb.st_mode & S_IFMT) == S_IFREG;
@@ -1082,16 +1112,12 @@ bool HHVM_FUNCTION(is_file,
 bool HHVM_FUNCTION(is_dir,
                    const String& filename) {
   CHECK_PATH_FALSE(filename, 1);
-  String cwd;
   if (filename.empty()) {
     return false;
   }
-  bool isRelative = (filename.charAt(0) != '/');
-  if (isRelative) cwd = g_context->getCwd();
-  if (!isRelative || cwd == String(RuntimeOption::SourceRoot)) {
-    if (File::IsVirtualDirectory(filename)) {
-      return true;
-    }
+  auto vtype = lookupVirtualFile(filename);
+  if (vtype != VFileType::NotFound) {
+    return vtype == VFileType::Directory;
   }
 
   struct stat sb;
@@ -1119,6 +1145,11 @@ bool HHVM_FUNCTION(is_uploaded_file,
 bool HHVM_FUNCTION(file_exists,
                    const String& filename) {
   CHECK_PATH_FALSE(filename, 1);
+  auto vtype = lookupVirtualFile(filename);
+  if (vtype != VFileType::NotFound) {
+    return true;
+  }
+
   if (filename.empty() ||
       (accessSyscall(filename, F_OK, true)) < 0) {
     return false;
@@ -1430,7 +1461,11 @@ bool HHVM_FUNCTION(chgrp,
   }
 
   int gid = get_gid(group);
-  if (gid == -1) return false;
+  if (gid == -1) {
+    raise_warning("chgrp(): Unable to find gid for %s",
+                  group.toString().c_str());
+    return false;
+  }
   CHECK_SYSTEM(chown(File::TranslatePath(filename).data(), (uid_t)-1, gid));
   return true;
 }
@@ -1455,7 +1490,11 @@ bool HHVM_FUNCTION(lchgrp,
   }
 
   int gid = get_gid(group);
-  if (gid == 0) return false;
+  if (gid == -1) {
+    raise_warning("lchgrp(): Unable to find gid for %s",
+                  group.toString().c_str());
+    return false;
+  }
   CHECK_SYSTEM(lchown(File::TranslatePath(filename).data(), (uid_t)-1, gid));
   return true;
 }
@@ -1676,19 +1715,23 @@ Variant HHVM_FUNCTION(glob,
                   nullptr,
                   &globbuf);
   if (nret == GLOB_NOMATCH) {
+    globfree(&globbuf);
     return empty_array();
   }
 
   if (!globbuf.gl_pathc || !globbuf.gl_pathv) {
     if (ThreadInfo::s_threadInfo->m_reqInjectionData.hasSafeFileAccess()) {
       if (!HHVM_FN(is_dir)(work_pattern)) {
+        globfree(&globbuf);
         return false;
       }
     }
+    globfree(&globbuf);
     return empty_array();
   }
 
   if (nret) {
+    globfree(&globbuf);
     return false;
   }
 
@@ -1825,37 +1868,50 @@ bool HHVM_FUNCTION(chroot,
 /**
  * A stack maintains the states of nested structures.
  */
-struct directory_data {
-  Resource defaultDirectory;
-  ~directory_data() {
-    defaultDirectory.detach();
+
+namespace {
+struct DirectoryData final : RequestEventHandler {
+  void requestInit() override {
+    assert(!defaultDirectory);
   }
+  void requestShutdown() override {
+    defaultDirectory = nullptr;
+  }
+  SmartPtr<Directory> defaultDirectory;
 };
-IMPLEMENT_THREAD_LOCAL(directory_data, s_directory_data);
-InitFiniNode file_init([]() {
-  s_directory_data->defaultDirectory.detach();
-}, InitFiniNode::When::ThreadInit);
+
+IMPLEMENT_STATIC_REQUEST_LOCAL(DirectoryData, s_directory_data);
 
 const StaticString
   s_handle("handle"),
   s_path("path");
 
-static Directory *get_dir(const Resource& dir_handle) {
+SmartPtr<Directory> get_dir(const Resource& dir_handle) {
   if (dir_handle.isNull()) {
     auto defaultDir = s_directory_data->defaultDirectory;
-    if (defaultDir.isNull()) {
+    if (!defaultDir) {
       raise_warning("no Directory resource supplied");
       return nullptr;
     }
-    return get_dir(defaultDir);
+    return defaultDir;
   }
 
-  Directory *d = dir_handle.getTyped<Directory>(true, true);
+  auto d = dyn_cast_or_null<Directory>(dir_handle);
   if (!d) {
     raise_warning("Not a valid directory resource");
     return nullptr;
   }
   return d;
+}
+
+bool StringDescending(const String& s1, const String& s2) {
+  return s1.more(s2);
+}
+
+bool StringAscending(const String& s1, const String& s2) {
+  return s1.less(s2);
+}
+
 }
 
 Variant HHVM_FUNCTION(dir,
@@ -1888,7 +1944,7 @@ Variant HHVM_FUNCTION(readdir,
   const Resource& res_dir_handle = dir_handle.isNull()
                                  ? null_resource
                                  : dir_handle.toResource();
-  Directory *dir = get_dir(res_dir_handle);
+  auto dir = get_dir(res_dir_handle);
   if (!dir) {
     return false;
   }
@@ -1900,19 +1956,11 @@ void HHVM_FUNCTION(rewinddir,
   const Resource& res_dir_handle = dir_handle.isNull()
                                  ? null_resource
                                  : dir_handle.toResource();
-  Directory *dir = get_dir(res_dir_handle);
+  auto dir = get_dir(res_dir_handle);
   if (!dir) {
     return;
   }
   dir->rewind();
-}
-
-static bool StringDescending(const String& s1, const String& s2) {
-  return s1.more(s2);
-}
-
-static bool StringAscending(const String& s1, const String& s2) {
-  return s1.less(s2);
 }
 
 Variant HHVM_FUNCTION(scandir,
@@ -1960,17 +2008,22 @@ void HHVM_FUNCTION(closedir,
   const Resource& res_dir_handle = dir_handle.isNull()
                                  ? null_resource
                                  : dir_handle.toResource();
-  Directory *d = get_dir(res_dir_handle);
+  auto d = get_dir(res_dir_handle);
   if (!d) {
     return;
   }
-  if (same(s_directory_data->defaultDirectory, d)) {
+  if (s_directory_data->defaultDirectory == d) {
     s_directory_data->defaultDirectory = nullptr;
   }
   d->close();
 }
 
 ///////////////////////////////////////////////////////////////////////////////
+
+const StaticString
+  s_STDIN("STDIN"),
+  s_STDOUT("STDOUT"),
+  s_STDERR("STDERR");
 
 void StandardExtension::initFile() {
 
@@ -2005,6 +2058,10 @@ void StandardExtension::initFile() {
   REGISTER_CONSTANT(SEEK_SET, k_SEEK_SET);
   REGISTER_CONSTANT(SEEK_CUR, k_SEEK_CUR);
   REGISTER_CONSTANT(SEEK_END, k_SEEK_END);
+
+  Native::registerConstant(s_STDIN.get(),  BuiltinFiles::GetSTDIN);
+  Native::registerConstant(s_STDOUT.get(), BuiltinFiles::GetSTDOUT);
+  Native::registerConstant(s_STDERR.get(), BuiltinFiles::GetSTDERR);
 
   HHVM_FE(fopen);
   HHVM_FE(popen);

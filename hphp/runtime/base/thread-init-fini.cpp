@@ -23,9 +23,9 @@
 #include "hphp/runtime/base/zend-math.h"
 #include "hphp/util/async-func.h"
 #include "hphp/util/alloc.h"
-#include "hphp/runtime/base/hardware-counter.h"
-#include "hphp/runtime/ext/asio/asio_session.h"
-#include "hphp/runtime/ext/extension.h"
+#include "hphp/util/hardware-counter.h"
+#include "hphp/runtime/ext/asio/asio-session.h"
+#include "hphp/runtime/ext/extension-registry.h"
 #include "hphp/runtime/base/intercept.h"
 
 #include "hphp/runtime/vm/repo.h"
@@ -62,7 +62,7 @@ void init_thread_locals(void *arg /* = NULL */) {
   g_context.getCheck();
   AsioSession::Init();
   HardwareCounter::s_counter.getCheck();
-  Extension::ThreadInitModules();
+  ExtensionRegistry::threadInit();
   for (InitFiniNode *in = extra_init; in; in = in->next) {
     in->func();
   }
@@ -73,7 +73,7 @@ void finish_thread_locals(void *arg /* = NULL */) {
   for (InitFiniNode *in = extra_fini; in; in = in->next) {
     in->func();
   }
-  Extension::ThreadShutdownModules();
+  ExtensionRegistry::threadShutdown();
   if (!g_context.isNull()) g_context.destroy();
 }
 

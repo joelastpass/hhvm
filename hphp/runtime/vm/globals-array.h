@@ -52,7 +52,7 @@ namespace HPHP {
  * to outlast the lifetime of the GlobalsArray.  (The wrapper is
  * refcounted, as required by ArrayData, but the table pointed to is not.)
  */
-struct GlobalsArray : private ArrayData {
+struct GlobalsArray : ArrayData {
   explicit GlobalsArray(NameValueTable* tab);
   ~GlobalsArray() {}
 
@@ -116,7 +116,7 @@ public:
   static void Renumber(ArrayData*);
   static void OnSetEvalScalar(ArrayData*);
 
-  static ArrayData* EscalateForSort(ArrayData*);
+  static ArrayData* EscalateForSort(ArrayData*, SortFunction sf);
   static void Ksort(ArrayData*, int sort_flags, bool ascending);
   static void Sort(ArrayData*, int sort_flags, bool ascending);
   static void Asort(ArrayData*, int sort_flags, bool ascending);
@@ -132,7 +132,13 @@ private:
   static GlobalsArray* asGlobals(ArrayData* ad);
   static const GlobalsArray* asGlobals(const ArrayData* ad);
 
+public:
+  template<class F> void scan(F& mark) const {
+    mark(m_tab);
+  }
+
 private:
+  template <typename F> friend void scan(const GlobalsArray&, F&);
   NameValueTable* const m_tab;
 };
 

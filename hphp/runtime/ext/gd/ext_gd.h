@@ -19,9 +19,10 @@
 #define incl_HPHP_EXT_IMAGE_H_
 
 
-#include "hphp/runtime/base/base-includes.h"
+#include "hphp/runtime/ext/extension.h"
 #include "hphp/runtime/base/zend-php-config.h"
-#include "hphp/runtime/ext/gd/libgd/gd.h"
+
+typedef struct gdImageStruct* gdImagePtr;
 
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
@@ -39,7 +40,7 @@ public:
   explicit Image(gdImagePtr gdImage) : m_gdImage(gdImage) {}
   ~Image();
   gdImagePtr get() { return m_gdImage;}
-  void reset() { m_gdImage = nullptr;}
+  void reset();
 
   CLASSNAME_IS("gd")
   // overriding ResourceData

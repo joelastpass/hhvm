@@ -90,6 +90,7 @@ function determine_flags(OptionMap $opts): string {
       '-v Eval.JitEnableRenameFunction=0 '.
       '-v Eval.GdbSyncChunks=1 '.
       '-v Eval.AllowHhas=true '.
+      '-v Eval.CheckReturnTypeHints=2 '.
       '';
   }
 
@@ -107,7 +108,6 @@ function determine_flags(OptionMap $opts): string {
     if ($opts['region-mode'] == 'method') {
       $flags .=
         '-v Eval.JitLoops=1 '.
-        '-v Eval.HHIRBytecodeControlFlow=1 '.
         '-v Eval.JitPGO=0 '.
         '';
       if (!$opts->containsKey('compile')) {
@@ -119,7 +119,6 @@ function determine_flags(OptionMap $opts): string {
       $flags .=
         '-v Eval.JitPGORegionSelector='.((string)$opts['region-mode']).' '.
         '-v Eval.JitLoops=1 '.
-        '-v Eval.HHIRBytecodeControlFlow=1 '.
         '';
     } else {
       $flags .=

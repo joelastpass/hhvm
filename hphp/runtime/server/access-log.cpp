@@ -33,8 +33,8 @@
 #include "hphp/util/process.h"
 #include "hphp/util/atomic.h"
 #include "hphp/util/compatibility.h"
+#include "hphp/util/hardware-counter.h"
 #include "hphp/util/timer.h"
-#include "hphp/runtime/base/hardware-counter.h"
 
 using std::endl;
 
@@ -63,6 +63,19 @@ void AccessLog::init(const std::string &defaultFormat,
   m_initialized = true;
   m_defaultFormat = defaultFormat;
   m_files = files;
+  openFiles(username);
+}
+
+void AccessLog::init(const std::string &defaultFormat,
+                     std::map<std::string, AccessLogFileData> &files,
+                     const std::string &username) {
+  Lock l(m_lock);
+  if (m_initialized) return;
+  m_initialized = true;
+  m_defaultFormat = defaultFormat;
+  for (auto it = files.begin(); it != files.end(); ++it) {
+    m_files.push_back(it->second);
+  }
   openFiles(username);
 }
 

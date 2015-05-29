@@ -20,27 +20,27 @@
 #include <functional>
 
 #include <folly/ScopeGuard.h>
-#include <folly/Optional.h>
 
-#include "hphp/runtime/vm/jit/containers.h"
 #include "hphp/runtime/vm/jit/block.h"
 #include "hphp/runtime/vm/jit/cfg.h"
-#include "hphp/runtime/vm/jit/cse.h"
+#include "hphp/runtime/vm/jit/containers.h"
 #include "hphp/runtime/vm/jit/frame-state.h"
 #include "hphp/runtime/vm/jit/guard-constraints.h"
-#include "hphp/runtime/vm/jit/ir-unit.h"
 #include "hphp/runtime/vm/jit/ir-opcode.h"
+#include "hphp/runtime/vm/jit/ir-unit.h"
 #include "hphp/runtime/vm/jit/region-selection.h"
 #include "hphp/runtime/vm/jit/simplify.h"
 #include "hphp/runtime/vm/jit/state-vector.h"
+#include "hphp/runtime/vm/jit/type-constraint.h"
+#include "hphp/runtime/vm/jit/type.h"
 
 namespace HPHP { namespace jit {
 
 //////////////////////////////////////////////////////////////////////
 
 struct ExnStackState {
-  int32_t spOffset;
-  int32_t syncedSpLevel;
+  FPInvOffset spOffset;
+  FPInvOffset syncedSpLevel;
   uint32_t stackDeficit;
   EvalStack evalStack;
   SSATmp* sp;
@@ -60,14 +60,6 @@ struct ExnStackState {
  *      internally runs preOptimize() on it, which can do some
  *      tracelet-state related modifications to the instruction.  For
  *      example, it can eliminate redundant guards.
- *
- *   - value numbering
- *
- *      After preOptimize, instructions that support it are hashed and
- *      looked up in the CSEHash for this trace.  If we find an
- *      available expression for the same value, instead of linking a
- *      new instruction into the trace we will just add a use to the
- *      previous SSATmp.
  *
  *   - simplification pass
  *
@@ -125,7 +117,7 @@ struct IRBuilder {
   IRUnit& unit() const { return m_unit; }
   BCMarker curMarker() const { return m_curMarker; }
   const Func* curFunc() const { return m_state.func(); }
-  int32_t spOffset() { return m_state.spOffset(); }
+  FPInvOffset spOffset() { return m_state.spOffset(); }
   SSATmp* sp() const { return m_state.sp(); }
   SSATmp* fp() const { return m_state.fp(); }
   uint32_t stackDeficit() const { return m_state.stackDeficit(); }
@@ -134,23 +126,27 @@ struct IRBuilder {
   void setStackDeficit(uint32_t d) { m_state.setStackDeficit(d); }
   void syncEvalStack() { m_state.syncEvalStack(); }
   EvalStack& evalStack() { return m_state.evalStack(); }
-  int32_t syncedSpLevel() const { return m_state.syncedSpLevel(); }
+  FPInvOffset syncedSpLevel() const { return m_state.syncedSpLevel(); }
   bool thisAvailable() const { return m_state.thisAvailable(); }
   void setThisAvailable() { m_state.setThisAvailable(); }
   Type localType(uint32_t id, TypeConstraint tc);
-  Type stackType(int32_t offset, TypeConstraint tc);
+  Type stackType(IRSPOffset, TypeConstraint tc);
   Type predictedInnerType(uint32_t id);
   Type predictedLocalType(uint32_t id);
+  Type predictedStackType(IRSPOffset);
   SSATmp* localValue(uint32_t id, TypeConstraint tc);
-  SSATmp* stackValue(int32_t offset, TypeConstraint tc);
+  SSATmp* stackValue(IRSPOffset offset, TypeConstraint tc);
   TypeSourceSet localTypeSources(uint32_t id) const {
     return m_state.localTypeSources(id);
   }
-  TypeSourceSet stackTypeSources(int32_t offset) const {
+  TypeSourceSet stackTypeSources(IRSPOffset offset) const {
     return m_state.stackTypeSources(offset);
   }
   bool frameMaySpanCall() const { return m_state.frameMaySpanCall(); }
-  Type stackInnerTypePrediction(int32_t offset) const;
+  Type stackInnerTypePrediction(IRSPOffset) const;
+  const PostConditions& postConds(Block* b) const {
+    return m_state.postConds(b);
+  }
 
   /*
    * Support for guard relaxation.
@@ -165,7 +161,7 @@ struct IRBuilder {
   bool constrainGuard(const IRInstruction* inst, TypeConstraint tc);
   bool constrainValue(SSATmp* const val, TypeConstraint tc);
   bool constrainLocal(uint32_t id, TypeConstraint tc, const std::string& why);
-  bool constrainStack(int32_t offset, TypeConstraint tc);
+  bool constrainStack(IRSPOffset offset, TypeConstraint tc);
   bool typeMightRelax(SSATmp* val = nullptr) const;
   const GuardConstraints* guards() const { return &m_constraints; }
 
@@ -178,7 +174,15 @@ public:
    * Start the given block.  Returns whether or not it succeeded.  A failure
    * may occur in case the block turned out to be unreachable.
    */
-  bool startBlock(Block* block, const BCMarker& marker, bool isLoopHeader);
+  bool startBlock(Block* block, bool hasUnprocPred);
+
+  /*
+   * Returns whether or not `block' will succeed if passed to
+   * startBlock, which implies that we have state saved for `block',
+   * and therefore it's currently reachable from the unit's entry
+   * block.
+   */
+  bool canStartBlock(Block* block) const;
 
   /*
    * Create a new block corresponding to bytecode control flow.
@@ -246,20 +250,13 @@ public:
   void popBlock();
 
   /*
-   * Run another pass of IRBuilder-managed optimizations on this
-   * unit.
-   */
-  void reoptimize();
-
-  /*
    * Conditionally-append a new instruction to the current Block, depending on
    * what some optimizations have to say about it.
    */
   enum class CloneFlag { Yes, No };
   SSATmp* optimizeInst(IRInstruction* inst,
                        CloneFlag doClone,
-                       Block* srcBlock,
-                       const folly::Optional<IdomVector>&);
+                       Block* srcBlock);
 
 
 private:
@@ -277,7 +274,7 @@ private:
   SSATmp* gen(Opcode op, Args&&... args) {
     return makeInstruction(
       [this] (IRInstruction* inst) {
-        return optimizeInst(inst, CloneFlag::Yes, nullptr, folly::none);
+        return optimizeInst(inst, CloneFlag::Yes, nullptr);
       },
       op,
       m_curMarker,
@@ -300,7 +297,6 @@ private:
   SSATmp* preOptimizeAssertLoc(IRInstruction*);
   SSATmp* preOptimizeCheckCtxThis(IRInstruction*);
   SSATmp* preOptimizeLdCtx(IRInstruction*);
-  SSATmp* preOptimizeDecRefThis(IRInstruction*);
   SSATmp* preOptimizeLdLocPseudoMain(IRInstruction*);
   SSATmp* preOptimizeLdLoc(IRInstruction*);
   SSATmp* preOptimizeStLoc(IRInstruction*);
@@ -311,13 +307,6 @@ private:
 
 private:
   void appendInstruction(IRInstruction* inst);
-  SSATmp* cseLookup(const IRInstruction&,
-                    const Block*,
-                    const folly::Optional<IdomVector>&) const;
-  void clearCse();
-  const CSEHash& cseHashTable(const IRInstruction& inst) const;
-  CSEHash& cseHashTable(const IRInstruction& inst);
-  void cseUpdate(const IRInstruction& inst);
   bool constrainSlot(int32_t idOrOffset,
                      TypeSource typeSrc,
                      TypeConstraint tc,
@@ -328,8 +317,6 @@ private:
   BCMarker m_initialMarker;
   BCMarker m_curMarker;
   FrameStateMgr m_state;
-  CSEHash m_cseHash;
-  bool m_enableCse{false};
 
   /*
    * m_savedBlocks will be nonempty iff we're emitting code to a block other
@@ -338,7 +325,13 @@ private:
    */
   jit::vector<BlockState> m_savedBlocks;
   Block* m_curBlock;
-  ExnStackState m_exnStack{0, 0, 0, EvalStack{}, nullptr};
+  ExnStackState m_exnStack{
+    FPInvOffset{0},
+    FPInvOffset{0},
+    0,
+    EvalStack{},
+    nullptr
+  };
 
   bool m_enableSimplification{false};
   bool m_constrainGuards;

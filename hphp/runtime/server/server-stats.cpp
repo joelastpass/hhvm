@@ -37,10 +37,10 @@
 #include "hphp/runtime/base/datetime.h"
 #include "hphp/runtime/base/array-init.h"
 #include "hphp/util/compatibility.h"
+#include "hphp/util/hardware-counter.h"
 #include "hphp/util/process.h"
 #include "hphp/util/timer.h"
 #include "hphp/util/text-util.h"
-#include "hphp/runtime/base/hardware-counter.h"
 #include "hphp/runtime/server/writer.h"
 namespace HPHP {
 //////////////////////////////////////////////////////////////////////
@@ -580,10 +580,10 @@ void ServerStats::ReportStatus(std::string &output, Writer::Format format) {
   timeval up;
   up.tv_sec = now - HttpServer::StartTime;
   up.tv_usec = 0;
-  w->writeEntry("now", DateTime(now).
-                toString(DateTime::DateFormatCookie).data());
-  w->writeEntry("start", DateTime(HttpServer::StartTime).
-                toString(DateTime::DateFormatCookie).data());
+  w->writeEntry("now", makeSmartPtr<DateTime>(now)->
+                       toString(DateTime::DateFormatCookie).data());
+  w->writeEntry("start", makeSmartPtr<DateTime>(HttpServer::StartTime)->
+                         toString(DateTime::DateFormatCookie).data());
   w->writeEntry("up", format_duration(up));
   w->endObject("process");
 
@@ -617,8 +617,8 @@ void ServerStats::ReportStatus(std::string &output, Writer::Format format) {
     w->writeEntry("tid", (int64_t)ts.m_threadPid);
     w->writeEntry("req", ts.m_requestCount);
     w->writeEntry("bytes", ts.m_writeBytes);
-    w->writeEntry("start", DateTime(ts.m_start.tv_sec).
-                  toString(DateTime::DateFormatCookie).data());
+    w->writeEntry("start", makeSmartPtr<DateTime>(ts.m_start.tv_sec)->
+                           toString(DateTime::DateFormatCookie).data());
     w->writeEntry("duration", format_duration(duration));
     if (ts.m_requestCount > 0) {
       auto const stats = ts.m_mm->getStatsCopy();
@@ -833,7 +833,7 @@ void ServerStats::startRequest(const char *url, const char *clientIP,
                                const char *vhost) {
   ++m_threadStatus.m_requestCount;
 
-  m_threadStatus.m_mm = ThreadInfo::s_threadInfo->m_mm;
+  m_threadStatus.m_mm = &MM();
   gettimeofday(&m_threadStatus.m_start, 0);
   memset(&m_threadStatus.m_done, 0, sizeof(m_threadStatus.m_done));
   m_threadStatus.m_mode = ThreadMode::Processing;

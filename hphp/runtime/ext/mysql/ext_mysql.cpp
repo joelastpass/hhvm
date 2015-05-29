@@ -23,6 +23,7 @@
 #include <folly/ScopeGuard.h>
 #include <folly/String.h>
 
+#include "hphp/runtime/base/actrec-args.h"
 #include "hphp/runtime/base/builtin-functions.h"
 #include "hphp/runtime/base/comparisons.h"
 #include "hphp/runtime/ext/mysql/mysql_common.h"
@@ -44,16 +45,16 @@ static Variant HHVM_FUNCTION(mysql_connect,
   int client_flags,
   int connect_timeout_ms,
   int query_timeout_ms) {
-  return php_mysql_do_connect(
-    server,
-    username,
-    password,
-    "",
-    client_flags,
-    false, false,
-    connect_timeout_ms,
-    query_timeout_ms
-  );
+  return Variant(php_mysql_do_connect(
+                   server,
+                   username,
+                   password,
+                   "",
+                   client_flags,
+                   false, false,
+                   connect_timeout_ms,
+                   query_timeout_ms
+                 ));
 }
 
 static Variant HHVM_FUNCTION(mysql_connect_with_db,
@@ -65,16 +66,16 @@ static Variant HHVM_FUNCTION(mysql_connect_with_db,
   int client_flags,
   int connect_timeout_ms,
   int query_timeout_ms) {
-  return php_mysql_do_connect(
-    server,
-    username,
-    password,
-    database,
-    client_flags,
-    false, false,
-    connect_timeout_ms,
-    query_timeout_ms
-  );
+  return Variant(php_mysql_do_connect(
+                   server,
+                   username,
+                   password,
+                   database,
+                   client_flags,
+                   false, false,
+                   connect_timeout_ms,
+                   query_timeout_ms
+                 ));
 }
 
 static Variant HHVM_FUNCTION(mysql_pconnect,
@@ -149,7 +150,7 @@ static Variant HHVM_FUNCTION(mysql_real_escape_string,
   return false;
 }
 
-static String HHVM_FUNCTION(mysql_get_client_info) {
+String HHVM_FUNCTION(mysql_get_client_info) {
   return String(mysql_get_client_info(), CopyString);
 }
 
@@ -177,7 +178,7 @@ static bool HHVM_FUNCTION(mysql_close,
   return MySQL::CloseConn(link_identifier);
 }
 
-static Variant HHVM_FUNCTION(mysql_errno,
+Variant HHVM_FUNCTION(mysql_errno,
                       const Variant& link_identifier /* = null */) {
   auto mySQL = MySQL::Get(link_identifier);
   if (!mySQL) {
@@ -194,7 +195,7 @@ static Variant HHVM_FUNCTION(mysql_errno,
   return false;
 }
 
-static Variant HHVM_FUNCTION(mysql_error,
+Variant HHVM_FUNCTION(mysql_error,
                       const Variant& link_identifier /* = null */) {
   auto mySQL = MySQL::Get(link_identifier);
   if (!mySQL) {
@@ -211,7 +212,7 @@ static Variant HHVM_FUNCTION(mysql_error,
   return false;
 }
 
-static Variant HHVM_FUNCTION(mysql_warning_count,
+Variant HHVM_FUNCTION(mysql_warning_count,
                       const Variant& link_identifier /* = null */) {
   auto mySQL = MySQL::Get(link_identifier);
   if (!mySQL) {
@@ -225,31 +226,31 @@ static Variant HHVM_FUNCTION(mysql_warning_count,
   return false;
 }
 
-static Variant HHVM_FUNCTION(mysql_get_host_info,
+Variant HHVM_FUNCTION(mysql_get_host_info,
                       const Variant& link_identifier /* = uninit_null() */) {
   MYSQL *conn = MySQL::GetConn(link_identifier);
   if (!conn) return false;
   return String(mysql_get_host_info(conn), CopyString);
 }
-static Variant HHVM_FUNCTION(mysql_get_proto_info,
+Variant HHVM_FUNCTION(mysql_get_proto_info,
                       const Variant& link_identifier /* = uninit_null() */) {
   MYSQL *conn = MySQL::GetConn(link_identifier);
   if (!conn) return false;
   return (int64_t)mysql_get_proto_info(conn);
 }
-static Variant HHVM_FUNCTION(mysql_get_server_info,
+Variant HHVM_FUNCTION(mysql_get_server_info,
                       const Variant& link_identifier /* = uninit_null() */) {
   MYSQL *conn = MySQL::GetConn(link_identifier);
   if (!conn) return false;
   return String(mysql_get_server_info(conn), CopyString);
 }
-static Variant HHVM_FUNCTION(mysql_info,
+Variant HHVM_FUNCTION(mysql_info,
                       const Variant& link_identifier /* = uninit_null() */) {
   MYSQL *conn = MySQL::GetConn(link_identifier);
   if (!conn) return false;
   return String(mysql_info(conn), CopyString);
 }
-static Variant HHVM_FUNCTION(mysql_insert_id,
+Variant HHVM_FUNCTION(mysql_insert_id,
                       const Variant& link_identifier /* = uninit_null() */) {
   MYSQL *conn = MySQL::GetConn(link_identifier);
   if (!conn) return false;
@@ -261,7 +262,7 @@ static Variant HHVM_FUNCTION(mysql_stat,
   if (!conn) return false;
   return String(mysql_stat(conn), CopyString);
 }
-static Variant HHVM_FUNCTION(mysql_thread_id,
+Variant HHVM_FUNCTION(mysql_thread_id,
                       const Variant& link_identifier /* = uninit_null() */) {
   MYSQL *conn = MySQL::GetConn(link_identifier);
   if (!conn) return false;
@@ -275,7 +276,7 @@ static bool HHVM_FUNCTION(mysql_select_db, const String& db,
   return mysql_select_db(conn, db.data()) == 0;
 }
 
-static Variant HHVM_FUNCTION(mysql_affected_rows,
+Variant HHVM_FUNCTION(mysql_affected_rows,
                       const Variant& link_identifier /* = uninit_null() */) {
   MYSQL *conn = MySQL::GetConn(link_identifier);
   if (!conn) return false;
@@ -297,6 +298,11 @@ static Variant HHVM_FUNCTION(mysql_multi_query, const String& query,
     return false;
   }
   auto mySQL = MySQL::Get(link_identifier);
+  if (!mySQL) {
+    raise_warning("supplied argument is not a valid MySQL-Link resource");
+    return false;
+  }
+
   if (!mySQL->m_multi_query &&
       !mysql_set_server_option(conn, MYSQL_OPTION_MULTI_STATEMENTS_ON)) {
     mySQL->m_multi_query = true;
@@ -508,7 +514,7 @@ static Variant HHVM_FUNCTION(mysql_async_query_result,
 }
 
 static bool HHVM_FUNCTION(mysql_async_query_completed, const Resource& result) {
-  auto const res = result.getTyped<MySQLResult>(true, true);
+  auto const res = dyn_cast_or_null<MySQLResult>(result);
   return !res || res->get() == nullptr;
 }
 
@@ -519,7 +525,7 @@ static Variant HHVM_FUNCTION(mysql_async_fetch_array, const Resource& result,
     return false;
   }
 
-  MySQLResult* res = php_mysql_extract_result(result);
+  auto res = php_mysql_extract_result(result);
   if (!res) {
     return false;
   }
@@ -606,8 +612,7 @@ static Variant HHVM_FUNCTION(mysql_async_wait_actionable, const Array& items,
       return empty_array();
     }
 
-    auto rsrc = entry.rvalAt(0).toResource();
-    auto conn = rsrc.getTyped<MySQLResource>()->mysql()->get();
+    auto conn = cast<MySQLResource>(entry.rvalAt(0))->mysql()->get();
 
     if (conn->async_op_status == ASYNC_OP_UNSET) {
       raise_warning("runtime/ext_mysql: no pending async operation in "
@@ -647,8 +652,7 @@ static Variant HHVM_FUNCTION(mysql_async_wait_actionable, const Array& items,
       return empty_array();
     }
 
-    auto rsrc = entry.rvalAt(0).toResource();
-    auto conn = rsrc.getTyped<MySQLResource>()->mysql()->get();
+    auto conn = cast<MySQLResource>(entry.rvalAt(0))->mysql()->get();
 
     pollfd* fd = &fds[nfds++];
     if (fd->fd != mysql_get_file_descriptor(conn)) {
@@ -680,7 +684,7 @@ static int64_t HHVM_FUNCTION(mysql_async_status,
 // row operations
 
 static bool HHVM_FUNCTION(mysql_data_seek, const Resource& result, int row) {
-  MySQLResult *res = php_mysql_extract_result(result);
+  auto res = php_mysql_extract_result(result);
   if (res == nullptr) return false;
 
   return res->seekRow(row);
@@ -724,7 +728,7 @@ static Variant HHVM_FUNCTION(mysql_fetch_object,
 }
 
 Variant HHVM_FUNCTION(mysql_fetch_lengths, const Resource& result) {
-  MySQLResult *res = php_mysql_extract_result(result);
+  auto res = php_mysql_extract_result(result);
   if (res == nullptr) return false;
 
   if (res->isLocalized()) {
@@ -760,7 +764,7 @@ Variant HHVM_FUNCTION(mysql_fetch_lengths, const Resource& result) {
 
 static Variant HHVM_FUNCTION(mysql_result, const Resource& result, int row,
                                     const Variant& field /* = 0 */) {
-  MySQLResult *res = php_mysql_extract_result(result);
+  auto res = php_mysql_extract_result(result);
   if (res == nullptr) return false;
 
   MYSQL_RES *mysql_result = nullptr;
@@ -850,7 +854,7 @@ static Variant HHVM_FUNCTION(mysql_result, const Resource& result, int row,
 // result functions
 
 Variant HHVM_FUNCTION(mysql_num_fields, const Resource& result) {
-  MySQLResult *res = php_mysql_extract_result(result);
+  auto res = php_mysql_extract_result(result);
   if (res) {
     return res->getFieldCount();
   }
@@ -858,7 +862,7 @@ Variant HHVM_FUNCTION(mysql_num_fields, const Resource& result) {
 }
 
 Variant HHVM_FUNCTION(mysql_num_rows, const Resource& result) {
-  MySQLResult *res = php_mysql_extract_result(result);
+  auto res = php_mysql_extract_result(result);
   if (res) {
     return res->getRowCount();
   }
@@ -866,7 +870,7 @@ Variant HHVM_FUNCTION(mysql_num_rows, const Resource& result) {
 }
 
 static bool HHVM_FUNCTION(mysql_free_result, const Resource& result) {
-  MySQLResult *res = php_mysql_extract_result(result);
+  auto res = php_mysql_extract_result(result);
   if (res) {
     res->close();
     return true;
@@ -879,7 +883,7 @@ static bool HHVM_FUNCTION(mysql_free_result, const Resource& result) {
 
 static Variant HHVM_FUNCTION(mysql_fetch_field, const Resource& result,
                                          int field /* = -1 */) {
-  MySQLResult *res = php_mysql_extract_result(result);
+  auto res = php_mysql_extract_result(result);
   if (res == nullptr) return false;
 
   if (field != -1) {
@@ -906,7 +910,7 @@ static Variant HHVM_FUNCTION(mysql_fetch_field, const Resource& result,
 }
 
 static bool HHVM_FUNCTION(mysql_field_seek, const Resource& result, int field) {
-  MySQLResult *res = php_mysql_extract_result(result);
+  auto res = php_mysql_extract_result(result);
   if (res == nullptr) return false;
   return res->seekField(field);
 }
@@ -1077,20 +1081,21 @@ void mysqlExtension::debuggerInfo(InfoVec &info) {
 }
 
 void mysqlExtension::moduleLoad(const IniSetting::Map& ini, Hdf config) {
-  Hdf mysql = config["MySQL"];
-  Config::Bind(ReadOnly, ini, mysql["ReadOnly"], false);
+  Config::Bind(ReadOnly, ini, config, "MySQL.ReadOnly", false);
 #ifdef FACEBOOK
-  Config::Bind(Localize, ini, mysql["Localize"], false);
+  Config::Bind(Localize, ini, config, "MySQL.Localize", false);
 #endif
-  Config::Bind(ConnectTimeout, ini, mysql["ConnectTimeout"], 1000);
-  Config::Bind(ReadTimeout, ini, mysql["ReadTimeout"], 60000);
-  Config::Bind(WaitTimeout, ini, mysql["WaitTimeout"], -1);
-  Config::Bind(SlowQueryThreshold, ini, mysql["SlowQueryThreshold"], 1000);
-  Config::Bind(KillOnTimeout, ini, mysql["KillOnTimeout"], false);
-  Config::Bind(MaxRetryOpenOnFail, ini, mysql["MaxRetryOpenOnFail"], 1);
-  Config::Bind(MaxRetryQueryOnFail, ini, mysql["MaxRetryQueryOnFail"], 1);
-  Config::Bind(Socket, ini, mysql["Socket"], "");
-  Config::Bind(TypedResults, ini, mysql["TypedResults"], true);
+  Config::Bind(ConnectTimeout, ini, config, "MySQL.ConnectTimeout", 1000);
+  Config::Bind(ReadTimeout, ini, config, "MySQL.ReadTimeout", 60000);
+  Config::Bind(WaitTimeout, ini, config, "MySQL.WaitTimeout", -1);
+  Config::Bind(SlowQueryThreshold, ini, config, "MySQL.SlowQueryThreshold",
+               1000);
+  Config::Bind(KillOnTimeout, ini, config, "MySQL.KillOnTimeout", false);
+  Config::Bind(MaxRetryOpenOnFail, ini, config, "MySQL.MaxRetryOpenOnFail", 1);
+  Config::Bind(MaxRetryQueryOnFail, ini, config, "MySQL.MaxRetryQueryOnFail",
+               1);
+  Config::Bind(Socket, ini, config, "MySQL.Socket", "");
+  Config::Bind(TypedResults, ini, config, "MySQL.TypedResults", true);
 }
 
 }

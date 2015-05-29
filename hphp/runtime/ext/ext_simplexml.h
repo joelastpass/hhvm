@@ -18,8 +18,9 @@
 #ifndef incl_HPHP_EXT_SIMPLEXML_H_
 #define incl_HPHP_EXT_SIMPLEXML_H_
 
-#include "hphp/runtime/base/base-includes.h"
+#include "hphp/runtime/ext/extension.h"
 #include "hphp/runtime/ext/ext_simplexml_include.h"
+#include "hphp/runtime/ext/libxml/ext_libxml.h"
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -45,19 +46,21 @@ typedef enum {
   SXE_ITER_ATTRLIST = 3
 } SXE_ITER;
 
-class c_SimpleXMLElement :
-      public ExtObjectDataFlags<ObjectData::UseGet|
-                                ObjectData::UseSet|
-                                ObjectData::UseIsset|
-                                ObjectData::UseUnset|
-                                ObjectData::CallToImpl|
-                                ObjectData::HasClone|
-                                ObjectData::HasPropEmpty>,
-      public Sweepable {
- public:
-  DECLARE_CLASS(SimpleXMLElement)
+using SimpleXMLElementBase = ExtObjectDataFlags<
+  ObjectData::UseGet|
+  ObjectData::UseSet|
+  ObjectData::UseIsset|
+  ObjectData::UseUnset|
+  ObjectData::CallToImpl|
+  ObjectData::HasClone|
+  ObjectData::HasPropEmpty
+>;
 
-  public: c_SimpleXMLElement(Class* cls = c_SimpleXMLElement::classof());
+struct c_SimpleXMLElement : SimpleXMLElementBase {
+  DECLARE_CLASS_NO_SWEEP(SimpleXMLElement)
+  void sweep();
+
+  explicit c_SimpleXMLElement(Class* cls = c_SimpleXMLElement::classof());
   public: ~c_SimpleXMLElement();
   public: void t___construct(const String& data, int64_t options = 0,
                              bool data_is_url = false, const String& ns = "",
@@ -98,8 +101,15 @@ class c_SimpleXMLElement :
   static double  ToDouble(const ObjectData* obj) noexcept;
   static Array   ToArray(const ObjectData* obj);
 
-  Resource   document;
-  xmlNodePtr node;
+  xmlNodePtr nodep() const {
+    return node ? node->nodep() : nullptr;
+  }
+
+  xmlDocPtr docp() const {
+    return node ? node->docp() : nullptr;
+  }
+
+  XMLNode node;
   xmlXPathContextPtr xpath;
   struct {
     xmlChar* name;
@@ -108,6 +118,10 @@ class c_SimpleXMLElement :
     SXE_ITER type;
     Object   data;
   } iter;
+
+ private:
+  SweepableMember<c_SimpleXMLElement> m_sweepable;
+  friend struct SweepableMember<c_SimpleXMLElement>;
 };
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -128,7 +142,7 @@ class c_SimpleXMLElementIterator : public ExtObjectData {
   public: Variant t_valid();
 
 public:
-  c_SimpleXMLElement* sxe;
+  SmartPtr<c_SimpleXMLElement> sxe;
 };
 
 ///////////////////////////////////////////////////////////////////////////////

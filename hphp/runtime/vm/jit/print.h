@@ -21,6 +21,7 @@
 #include "hphp/util/trace.h"
 #include "hphp/runtime/vm/jit/code-gen.h"
 #include "hphp/runtime/vm/jit/reg-alloc.h"
+#include "hphp/runtime/vm/jit/type-constraint.h"
 #include "hphp/runtime/vm/jit/type.h"
 
 namespace HPHP { namespace jit {
@@ -70,8 +71,8 @@ static inline bool dumpIREnabled(int level = 1) {
   return HPHP::Trace::moduleEnabledRelease(HPHP::Trace::printir, level);
 }
 
-constexpr int kIRLevel = 1;
-constexpr int kCodeGenLevel = 2;
+constexpr int kCodeGenLevel = 1;
+constexpr int kIRLevel = 2;
 constexpr int kOptLevel = 3;
 constexpr int kTraceletLevel = 4;
 constexpr int kRegAllocLevel = 4;

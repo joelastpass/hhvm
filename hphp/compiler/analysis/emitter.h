@@ -24,12 +24,18 @@
 #include "hphp/compiler/statement/trait_prec_statement.h"
 #include "hphp/compiler/statement/trait_alias_statement.h"
 #include "hphp/compiler/statement/typedef_statement.h"
+#include "hphp/compiler/expression/binary_op_expression.h"
+#include "hphp/compiler/expression/object_property_expression.h"
+#include "hphp/parser/parser.h"
 
+#include "hphp/runtime/base/header-kind.h"
 #include "hphp/runtime/vm/func.h"
 #include "hphp/runtime/vm/func-emitter.h"
 #include "hphp/runtime/vm/unit.h"
 #include "hphp/runtime/vm/unit-emitter.h"
 #include "hphp/util/hash.h"
+
+#include <folly/Optional.h>
 
 #include <deque>
 #include <utility>
@@ -492,15 +498,13 @@ public:
     return m_retLocal;
   }
 
-  class IncludeTimeFatalException : public Exception {
-  public:
+  struct IncludeTimeFatalException : Exception {
     ConstructPtr m_node;
     bool m_parseFatal;
     IncludeTimeFatalException(ConstructPtr node, const char* fmt, ...)
         : Exception(), m_node(node), m_parseFatal(false) {
       va_list ap; va_start(ap, fmt); format(fmt, ap); va_end(ap);
     }
-    virtual ~IncludeTimeFatalException() throw() {}
     EXCEPTION_COMMON_IMPL(IncludeTimeFatalException);
     void setParseFatal(bool b = true) { m_parseFatal = b; }
   };
@@ -616,8 +620,9 @@ private:
   };
 
 private:
-  static const size_t kMinStringSwitchCases = 8;
-  static const bool systemlibDefinesIdx =
+  static constexpr size_t kMinIntSwitchCases = 2;
+  static constexpr size_t kMinStringSwitchCases = 8;
+  static constexpr bool systemlibDefinesIdx =
 #ifdef FACEBOOK
     true
 #else
@@ -653,6 +658,7 @@ private:
   std::deque<FaultRegion*> m_faultRegions;
   std::deque<FPIRegion*> m_fpiRegions;
   std::vector<Array> m_staticArrays;
+  std::vector<folly::Optional<CollectionType>> m_staticColType;
   std::set<std::string,stdltistr> m_hoistables;
   LocationPtr m_tempLoc;
   std::unordered_set<std::string> m_staticEmitted;
@@ -716,10 +722,16 @@ public:
   void emitStringSwitch(Emitter& e, SwitchStatementPtr s,
                         std::vector<Label>& caseLabels, Label& done,
                         const SwitchState& state);
-
+  void emitArrayInit(Emitter& e, ExpressionListPtr el,
+                     folly::Optional<CollectionType> ct = folly::none);
+  void emitPairInit(Emitter&e, ExpressionListPtr el);
+  void emitVectorInit(Emitter&e, CollectionType ct, ExpressionListPtr el);
+  void emitMapInit(Emitter&e, CollectionType ct, ExpressionListPtr el);
+  void emitSetInit(Emitter&e, CollectionType ct, ExpressionListPtr el);
+  void emitCollectionInit(Emitter& e, BinaryOpExpressionPtr exp);
   void markElem(Emitter& e);
   void markNewElem(Emitter& e);
-  void markProp(Emitter& e);
+  void markProp(Emitter& e, PropAccessType propAccessType);
   void markSProp(Emitter& e);
   void markName(Emitter& e);
   void markNameSecond(Emitter& e);
@@ -746,6 +758,7 @@ public:
                              ExpressionListPtr params,
                              bool coerce_params = false);
   void emitMethodPrologue(Emitter& e, MethodStatementPtr meth);
+  void emitDeprecationWarning(Emitter& e, MethodStatementPtr meth);
   void emitMethod(MethodStatementPtr meth);
   void emitMemoizeProp(Emitter& e, MethodStatementPtr meth, Id localID,
                        const std::vector<Id>& paramIDs, uint numParams);
@@ -780,9 +793,11 @@ public:
   void emitFuncCall(Emitter& e, FunctionCallPtr node,
                     const char* nameOverride = nullptr,
                     ExpressionListPtr paramsOverride = nullptr);
-  void emitFuncCallArg(Emitter& e, ExpressionPtr exp, int paramId);
+  void emitFuncCallArg(Emitter& e, ExpressionPtr exp, int paramId,
+                       bool isUnpack);
   void emitBuiltinCallArg(Emitter& e, ExpressionPtr exp, int paramId,
                          bool byRef);
+  void emitLambdaCaptureArg(Emitter& e, ExpressionPtr exp);
   void emitBuiltinDefaultArg(Emitter& e, Variant& v,
                              MaybeDataType t, int paramId);
   void emitClass(Emitter& e, ClassScopePtr cNode, bool topLevel);
@@ -870,8 +885,8 @@ public:
   void copyOverFPIRegions(FuncEmitter* fe);
   void saveMaxStackCells(FuncEmitter* fe);
   void finishFunc(Emitter& e, FuncEmitter* fe);
-
-  void initScalar(TypedValue& tvVal, ExpressionPtr val);
+  void initScalar(TypedValue& tvVal, ExpressionPtr val,
+                  folly::Optional<CollectionType> ct = folly::none);
   bool requiresDeepInit(ExpressionPtr initExpr) const;
 
   void emitClassTraitPrecRule(PreClassEmitter* pce, TraitPrecStatementPtr rule);
@@ -909,8 +924,6 @@ void emitAllHHBC(AnalysisResultPtr&& ar);
 
 
 extern "C" {
-  StringData* hphp_compiler_serialize_code_model_for(String code,
-                                                     String prefix);
   Unit* hphp_compiler_parse(const char* code, int codeLen, const MD5& md5,
                             const char* filename);
   Unit* hphp_build_native_func_unit(const HhbcExtFuncInfo* builtinFuncs,
